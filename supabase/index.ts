@@ -80,6 +80,22 @@ async function timedQuery(query, label, timeoutMs = QUERY_TIMEOUT_MS) {
 }
 // SPEC: purge runs at startup (cold start here) and at least daily (pg_cron job).
 const startupPurge = timedQuery(sql`select cutout.purge(${RETENTION_DAYS})`, "startup_purge", 2000).catch((e)=>console.error("startup purge failed", e));
+// Compare SHA-256 digests with a fixed-time loop, so the time taken does not
+// depend on how much of a guessed token matches (a plain !== returns at the
+// first differing character). Digests also make both sides the same length.
+const enc = new TextEncoder();
+const sha256 = async (s: string)=>new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(s)));
+const expectedAuth = sha256(`Bearer ${BUS_TOKEN}`);
+async function authorized(header: string) {
+  if (!BUS_TOKEN) return false;
+  const [a, b] = await Promise.all([
+    sha256(header),
+    expectedAuth
+  ]);
+  let diff = 0;
+  for(let i = 0; i < a.length; i++)diff |= a[i] ^ b[i];
+  return diff === 0;
+}
 // ---- ULID (Crockford base32, 48-bit time + 80-bit random) -------------------
 const C32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 function ulid(now = Date.now()) {
@@ -536,7 +552,7 @@ async function route(req, arrivedAt) {
     state: null
   };
   const auth = req.headers.get("Authorization") ?? "";
-  if (!BUS_TOKEN || auth !== `Bearer ${BUS_TOKEN}`) return {
+  if (!await authorized(auth)) return {
     res: jres(401, {
       error: "unauthorized"
     }),

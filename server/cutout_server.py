@@ -829,6 +829,13 @@ class Handler(BaseHTTPRequestHandler):
 
 # --------------------------------------------------------------------------
 
+class Server(ThreadingHTTPServer):
+    # socketserver's default listen backlog is 5: with more simultaneous
+    # connects (several agents long-polling at once) the rest are dropped
+    # or refused by the OS before the server can accept them.
+    request_queue_size = 128
+
+
 def main():
     ap = argparse.ArgumentParser(description="Project Cutout reference server")
     ap.add_argument("--host", default=os.environ.get("CUTOUT_HOST",
@@ -868,7 +875,7 @@ def main():
                 "cutout: startup retention purge: %d messages deleted,"
                 " %d expired links marked consumed\n" % (deleted, marked))
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = Server((args.host, args.port), Handler)
     sys.stderr.write(
         "cutout: listening on http://%s:%d (db: %s)\n"
         % (args.host, args.port, args.db))

@@ -31,6 +31,7 @@ Run:  python3 tests/smoke_test.py
 
 import json
 import os
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -686,6 +687,68 @@ class UnauthenticatedRateLimitTest(unittest.TestCase):
         self.assertEqual(st, 200)
         h = {k.lower(): v for k, v in headers.items()}
         self.assertEqual(h.get("x-ratelimit-remaining"), "59")
+
+
+class BacklogTest(unittest.TestCase):
+    """Own server, because the test pauses it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = free_port()
+        cls.base_url = "http://127.0.0.1:%d" % cls.port
+        cls.tmp = tempfile.TemporaryDirectory()
+        db = os.path.join(cls.tmp.name, "smoke.db")
+        env = dict(os.environ, CUTOUT_TOKEN=TOKEN)
+        cls.proc = subprocess.Popen(
+            [sys.executable, SERVER, "--port", str(cls.port), "--db", db],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                st, _, _ = raw_request(cls.base_url, "GET", "/health")
+                if st == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("server did not start")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait()
+        cls.tmp.cleanup()
+
+    @unittest.skipUnless(hasattr(signal, "SIGSTOP"), "needs SIGSTOP")
+    def test_concurrent_connections_are_queued(self):
+        # Pause the server so it accepts nothing, open more connections
+        # than socketserver's default backlog (5), resume it, and expect
+        # every connection to be served.
+        n = 16
+        socks = []
+        os.kill(self.proc.pid, signal.SIGSTOP)
+        try:
+            for _ in range(n):
+                s = socket.socket()
+                s.settimeout(1)
+                try:
+                    s.connect(("127.0.0.1", self.port))
+                    socks.append(s)
+                except OSError:
+                    s.close()
+        finally:
+            os.kill(self.proc.pid, signal.SIGCONT)
+        served = 0
+        for s in socks:
+            with s:
+                s.settimeout(5)
+                s.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                          b"Connection: close\r\n\r\n")
+                if s.makefile("rb").readline().split()[1:2] == [b"200"]:
+                    served += 1
+        self.assertEqual(served, n, "%d connected, %d served"
+                         % (len(socks), served))
 
 
 if __name__ == "__main__":
