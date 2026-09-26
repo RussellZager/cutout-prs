@@ -312,6 +312,7 @@ cutout/
 ```
 
 Run the tests: `python3 tests/smoke_test.py` (15 tests, ~2s).
+Check both servers against the same black-box suite: `python3 tests/run_conformance.py --target python` (or `--target supabase`; see CONTRIBUTING.md).
 
 ## Credits
 

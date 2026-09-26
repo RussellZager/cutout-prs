@@ -25,6 +25,27 @@ a PR.
   change the other, and say so in the PR.
 - Clarity over cleverness, in code and in docs.
 
+## Conformance suite
+
+`tests/run_conformance.py` runs one black-box HTTP suite (standard
+library `unittest`) against either server:
+
+```sh
+python3 tests/run_conformance.py --target python     # reference server + SQLite
+python3 tests/run_conformance.py --target supabase   # edge function + local Postgres
+```
+
+- The supabase target runs `supabase/index.ts` under Deno against a
+  throwaway Postgres 16 cluster. It needs `deno`, `initdb`, `pg_ctl` and
+  `psql` on PATH. No Docker, nothing hosted. Only the pg_cron statements
+  of `schema.sql` are left out, because a plain cluster lacks pg_cron.
+- A target is never skipped. A missing tool or a server that does not
+  start exits 2. When you change one server, run both targets.
+- Tests marked `@known_bug("<target>", "<fix>")` fail today because of a
+  bug that an open PR fixes. They count as expected failures. When the
+  fix merges, the test reports "unexpected success" and the run fails:
+  delete the marker (or narrow its target) in that PR.
+
 ## House conventions
 
 - **No names anywhere.** The license line is "the Cutout contributors"
