@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """Project Cutout — smoke test.
 
@@ -686,6 +685,19 @@ class UnauthenticatedRateLimitTest(unittest.TestCase):
         self.assertEqual(st, 200)
         h = {k.lower(): v for k, v in headers.items()}
         self.assertEqual(h.get("x-ratelimit-remaining"), "59")
+
+
+class ExecutableTest(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "shebang scripts are POSIX-only")
+    def test_server_runs_directly(self):
+        # ./server/cutout_server.py needs the shebang on line 1 and +x.
+        try:
+            out = subprocess.run([SERVER, "--help"], capture_output=True,
+                                 text=True, timeout=30)
+        except OSError as exc:
+            self.fail("cannot run %s directly: %s" % (SERVER, exc))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("usage", out.stdout.lower())
 
 
 if __name__ == "__main__":

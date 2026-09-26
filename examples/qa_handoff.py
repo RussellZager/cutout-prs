@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """Project Cutout — two-agent QA handoff demo.
 

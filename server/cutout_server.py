@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Project Cutout — reference server (API v1.1).
