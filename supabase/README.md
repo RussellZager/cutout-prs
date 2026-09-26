@@ -9,7 +9,10 @@ same endpoints, fields, and status codes.
 - `index.ts` — the edge function (Deno, `npm:postgres`). Config is env
   only, no secrets in code.
 - `schema.sql` — base schema: messages, receipts, rate log, meta, and
-  the retention purge (runs at cold start and daily via pg_cron).
+  the retention purge (runs at cold start, and daily via pg_cron when
+  the extension is available). Every table has RLS on with no
+  policies, and the `anon`/`authenticated` roles get no privileges:
+  only the edge function's owner connection reads or writes.
   Idempotent: re-run it on an existing install to pick up purge fixes.
 - `schema_v1.1.sql` — v1 → v1.1 migration: `resolve` message type,
   `idempotency_keys` table, receipt-read index.

@@ -77,11 +77,37 @@ begin
   return jsonb_build_object('purged', purged, 'links_marked_consumed', marked);
 end $$;
 
+-- Only the edge function (connected as the table owner) touches this schema.
+-- RLS with no policies on every table, and no privileges for the API roles,
+-- so exposing the schema through the Data API never exposes the bus.
+alter table cutout.messages enable row level security;
+alter table cutout.receipts enable row level security;
+alter table cutout.rate_log enable row level security;
+alter table cutout.meta     enable row level security;
+do $$
+declare r text;
+begin
+  foreach r in array array['public', 'anon', 'authenticated'] loop
+    if r = 'public' or exists (select 1 from pg_roles where rolname = r) then
+      execute format('revoke all on schema cutout from %I', r);
+      execute format('revoke all on all tables in schema cutout from %I', r);
+      execute format('revoke all on function cutout.purge(int) from %I', r);
+    end if;
+  end loop;
+end $$;
+
 -- Daily purge via pg_cron (belt) on top of edge-function cold-start purge (braces).
-create extension if not exists pg_cron;
+-- Skipped on Postgres without pg_cron; the cold-start purge still runs.
 do $$
 begin
-  perform cron.unschedule('cutout-daily-purge');
-exception when others then null;
+  if not exists (select 1 from pg_available_extensions where name = 'pg_cron') then
+    raise notice 'pg_cron not available; skipping the daily purge job';
+    return;
+  end if;
+  create extension if not exists pg_cron;
+  begin
+    perform cron.unschedule('cutout-daily-purge');
+  exception when others then null;
+  end;
+  perform cron.schedule('cutout-daily-purge', '17 4 * * *', $cron$select cutout.purge(30);$cron$);
 end $$;
-select cron.schedule('cutout-daily-purge', '17 4 * * *', $cron$select cutout.purge(30);$cron$);
