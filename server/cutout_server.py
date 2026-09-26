@@ -173,6 +173,39 @@ def valid_expires_at(value):
         and parse_timestamp(value) is not None
 
 
+def attachments_error(a):
+    """Spec: metadata.attachments = [{name, url, mime?, size?}]; url is
+    http(s), mime a string, size a non-negative integer. Returns an error
+    message, or None when valid (same rules as the edge function)."""
+    if not isinstance(a, list):
+        return "metadata.attachments must be an array"
+    for i, x in enumerate(a):
+        if not isinstance(x, dict):
+            return "attachments[%d] must be an object" % i
+        if not isinstance(x.get("name"), str) or not x["name"]:
+            return "attachments[%d].name is required" % i
+        url = x.get("url")
+        if not isinstance(url, str):
+            return "attachments[%d].url is required" % i
+        try:
+            parts = urlparse(url)
+        except ValueError:
+            return "attachments[%d].url must be a valid URL" % i
+        if parts.scheme not in ("http", "https"):
+            return "attachments[%d].url must be http(s)" % i
+        if not parts.netloc:
+            return "attachments[%d].url must be a valid URL" % i
+        mime = x.get("mime")
+        if mime is not None and not isinstance(mime, str):
+            return "attachments[%d].mime must be a string" % i
+        size = x.get("size")
+        whole = (isinstance(size, int) and not isinstance(size, bool)) or \
+            (isinstance(size, float) and size.is_integer())
+        if size is not None and not (whole and size >= 0):
+            return "attachments[%d].size must be a non-negative integer" % i
+    return None
+
+
 # --------------------------------------------------------------------------
 # storage
 # --------------------------------------------------------------------------
@@ -441,12 +474,12 @@ class Store:
             "to": r["recipient"],
             "type": r["type"],
             "body": r["body"],
+            # optional fields are always present (null / {}), as in the
+            # SPEC message object and the edge function
+            "reply_to": r["reply_to"],
             "created_at": r["created_at"],
+            "metadata": meta if meta is not None else {},
         }
-        if r["reply_to"]:
-            msg["reply_to"] = r["reply_to"]
-        if meta is not None:
-            msg["metadata"] = meta
         msg["_seq"] = r["seq"]  # internal; stripped before responding
         return msg
 
@@ -671,6 +704,11 @@ class Handler(BaseHTTPRequestHandler):
                 len(json.dumps(metadata).encode("utf-8")) > METADATA_MAX_BYTES:
             self._err(413, "metadata exceeds 16 KB")
             return
+        if metadata is not None and "attachments" in metadata:
+            err = attachments_error(metadata["attachments"])
+            if err:
+                self._err(422, err)
+                return
         if idempotency_key is not None:
             if not isinstance(idempotency_key, str) \
                     or not idempotency_key.strip() \
@@ -801,7 +839,7 @@ class Handler(BaseHTTPRequestHandler):
                       % ", ".join(sorted(RECEIPT_STATUSES)))
             return
         if self.store.get_message(message_id) is None:
-            self._err(404, "unknown message_id")
+            self._err(404, "message not found")
             return
 
         # idempotent on (message_id, agent): re-posting is a no-op update

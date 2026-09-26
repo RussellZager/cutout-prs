@@ -26,6 +26,7 @@ const RECEIPT_STATUSES = [
   "acted",
   "consumed"
 ];
+const AGENT_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/; // SPEC: agent ids are kebab-case
 // Edge clients and intermediary proxies can drop silent requests well before the platform idle limit.
 // Keep a response budget for database operations and network transit after the hold.
 const MAX_HOLD_SECONDS = 10;
@@ -118,7 +119,7 @@ function decodeCursor(c) {
     const i = raw.indexOf("|");
     if (i < 0) return null;
     const usStr = raw.slice(0, i), id = raw.slice(i + 1);
-    if (!/^\d{10,17}$/.test(usStr) || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) return null;
+    if (!/^\d{1,17}$/.test(usStr) || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) return null;
     return {
       us: Number(usStr),
       id
@@ -127,6 +128,9 @@ function decodeCursor(c) {
     return null;
   }
 }
+// Handed back on an empty first poll: a cursor at the very start of the log,
+// so next_cursor is always a string (SPEC) and re-polling with it misses nothing.
+const START_CURSOR = encodeCursor(0, "0");
 function serialize(m) {
   return {
     id: m.id,
@@ -258,6 +262,11 @@ async function postMessage(req) {
       error: "invalid JSON"
     });
   }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return jres(422, {
+      error: "request body must be a JSON object"
+    });
+  }
   for (const f of [
     "thread_id",
     "from",
@@ -265,11 +274,28 @@ async function postMessage(req) {
     "type",
     "body"
   ]){
-    if (typeof body[f] !== "string" || body[f].length === 0) {
+    if (typeof body[f] !== "string" || body[f].trim().length === 0) {
       return jres(422, {
         error: `${f} is required`
       });
     }
+  }
+  // Same normalization as the Python server: surrounding whitespace is ignored.
+  for (const f of [
+    "thread_id",
+    "from",
+    "to",
+    "type"
+  ])body[f] = body[f].trim();
+  if (!AGENT_RE.test(body.from)) {
+    return jres(422, {
+      error: "from must be a kebab-case agent id"
+    });
+  }
+  if (body.to !== "*" && !AGENT_RE.test(body.to)) {
+    return jres(422, {
+      error: "to must be a kebab-case agent id or '*'"
+    });
   }
   if (!TYPES.includes(body.type)) {
     return jres(422, {
@@ -286,7 +312,7 @@ async function postMessage(req) {
       error: "reply_to must be a string"
     });
   }
-  if (body.metadata !== undefined && (typeof body.metadata !== "object" || body.metadata === null || Array.isArray(body.metadata))) {
+  if (body.metadata !== undefined && body.metadata !== null && (typeof body.metadata !== "object" || Array.isArray(body.metadata))) {
     return jres(422, {
       error: "metadata must be an object"
     });
@@ -303,18 +329,26 @@ async function postMessage(req) {
       error: err
     });
   }
+  if (body.type === "link") {
+    const link = metadata.one_time_link;
+    if (typeof link !== "object" || link === null || Array.isArray(link) || !link.url) {
+      return jres(422, {
+        error: "link messages require metadata.one_time_link.url"
+      });
+    }
+  }
   const linkErr = validOneTimeLink(metadata.one_time_link);
   if (linkErr) return jres(422, {
     error: linkErr
   });
   let idemKey = null;
   if (body.idempotency_key !== undefined && body.idempotency_key !== null) {
-    if (typeof body.idempotency_key !== "string" || body.idempotency_key.length === 0 || body.idempotency_key.length > MAX_IDEMPOTENCY_KEY) {
+    if (typeof body.idempotency_key !== "string" || body.idempotency_key.trim().length === 0 || body.idempotency_key.length > MAX_IDEMPOTENCY_KEY) {
       return jres(422, {
         error: `idempotency_key must be a non-empty string of at most ${MAX_IDEMPOTENCY_KEY} characters`
       });
     }
-    idemKey = body.idempotency_key;
+    idemKey = body.idempotency_key.trim();
   }
   const from = body.from;
   const findDup = async ()=>idemKey === null ? [] : await sql`
@@ -435,7 +469,7 @@ async function getMessages(req, arrivedAt) {
       receiptsBy.set(r.message_id, list);
     }
   }
-  const nextCursor = rows.length ? encodeCursor(Number(rows[rows.length - 1].created_us), rows[rows.length - 1].id) : since ?? null;
+  const nextCursor = rows.length ? encodeCursor(Number(rows[rows.length - 1].created_us), rows[rows.length - 1].id) : since || START_CURSOR;
   return jres(200, {
     messages: rows.map((r)=>({
         ...serialize(r),
@@ -453,6 +487,11 @@ async function postReceipt(req) {
       error: "invalid JSON"
     });
   }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return jres(422, {
+      error: "request body must be a JSON object"
+    });
+  }
   for (const f of [
     "message_id",
     "agent",
@@ -463,6 +502,11 @@ async function postReceipt(req) {
         error: `${f} is required`
       });
     }
+  }
+  if (!AGENT_RE.test(body.agent)) {
+    return jres(422, {
+      error: "agent must be a kebab-case agent id"
+    });
   }
   if (!RECEIPT_STATUSES.includes(body.status)) {
     return jres(422, {

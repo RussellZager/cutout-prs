@@ -7,7 +7,10 @@ then exercises every endpoint and asserts the key behaviors:
 
   - /health needs no auth
   - 401 without / with a bad token
-  - 422 validation (missing fields, bad type, oversize body, bad cursor)
+  - 422 validation (missing fields, bad type, oversize body, bad cursor,
+    bad attachments)
+  - message shape shared with the edge function (reply_to / metadata
+    always present; next_cursor always a string)
   - cursor pagination + cursor echo on empty polls
   - long-poll (?wait=N) returns early when a message arrives
   - receipt idempotency + receipts visible on message reads
@@ -254,6 +257,14 @@ class SmokeTest(unittest.TestCase):
                                    to="instinct", type="link",
                                    body="a link with nowhere to go")
         self.assertEqual(ctx.exception.status, 422)
+        # attachments must follow the SPEC convention
+        for bad in ("not-an-array",
+                    [{"name": "a.txt", "url": "javascript:alert(1)"}]):
+            with self.assertRaises(CutoutError) as ctx:
+                self.koda.post_message(thread_id="t", from_="koda",
+                                       to="instinct", type="note", body="x",
+                                       metadata={"attachments": bad})
+            self.assertEqual(ctx.exception.status, 422)
         # bad query params
         with self.assertRaises(CutoutError) as ctx:
             self.koda.get_messages(since="not-a-cursor")
@@ -279,8 +290,19 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(m["from"], "koda")
         self.assertEqual(m["to"], "instinct")
         self.assertNotIn("_seq", m)  # internal field must not leak
+        # same message shape as the edge function: every field present,
+        # optional ones as null / {}
+        self.assertEqual(sorted(m), sorted([
+            "id", "thread_id", "from", "to", "type", "body", "reply_to",
+            "created_at", "metadata", "receipts"]))
+        self.assertIsNone(m["reply_to"])
+        self.assertEqual(m["metadata"], {})
 
     def test_05_cursor_pagination(self):
+        # a first poll with nothing to return still hands back a cursor
+        empty = self.koda.get_messages(thread_id="smoke-never-used")
+        self.assertEqual(empty["messages"], [])
+        self.assertIsInstance(empty["next_cursor"], str)
         for i in range(3):
             self.koda.post_message(thread_id="smoke-pages", from_="koda",
                                    to="*", type="note",
@@ -388,6 +410,8 @@ class SmokeTest(unittest.TestCase):
             self.instinct.post_receipt("msg_doesnotexist", "instinct",
                                        "received")
         self.assertEqual(ctx.exception.status, 404)
+        self.assertEqual(json.loads(ctx.exception.body),
+                         {"error": "message not found"})
 
     def test_10_threads_unread(self):
         self.koda.post_message(thread_id="smoke-unread", from_="koda",
