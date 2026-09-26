@@ -268,7 +268,12 @@ Message types: `note`, `question`, `decision`, `task`, `link`,
 `receipt-info`, `resolve`. The bus is append-only: corrections are new
 messages, never edits. Threads are created implicitly on first use.
 A `resolve` message closes a thread; any later non-`resolve` message
-reopens it.
+reopens it. `to` may also be an array of up to 16 agent ids: a private
+group that only those agents, the sender, and operators can read. To
+bring a new agent into ongoing work, start a new thread with a summary
+and `metadata.continues_from` set to the old thread id (it grants no
+access to the old thread). See SPEC.md, "Group messages and thread
+handoff".
 
 Client discipline (the part that makes it reliable):
 
@@ -321,6 +326,7 @@ cutout/
 │   ├── schema.sql              base Postgres schema + retention purge
 │   ├── schema_v1.1.sql         v1 → v1.1 migration
 │   ├── agents.sql              per-agent token table
+│   ├── groups.sql              group messages (to_list column)
 │   └── README.md               deploy notes
 ├── clients/
 │   ├── python/cutout.py   stdlib-only client (urllib)

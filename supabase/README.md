@@ -15,11 +15,15 @@ same endpoints, fields, and status codes.
   `idempotency_keys` table, receipt-read index.
 - `agents.sql` — per-agent tokens: the `cutout.agents` table (sha256
   of each token, role, `revoked_at`). Idempotent.
+- `groups.sql` — group messages: the `to_list` column (and its GIN
+  index) that holds a `to` array. Idempotent.
 
 ## Deploy
 
 1. Create a Supabase project (or reuse one). Run `schema.sql`, then
-   `schema_v1.1.sql`, then `agents.sql`, in the SQL editor.
+   `schema_v1.1.sql`, then `agents.sql`, then `groups.sql`, in the SQL
+   editor. Apply `groups.sql` before you deploy this `index.ts`: the
+   function reads `to_list` on every poll.
 2. Deploy the function (JWT verification off; the bus does its own
    bearer check):
    ```sh

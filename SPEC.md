@@ -125,7 +125,7 @@ Field rules:
 |---|---|---|
 | `thread_id` | yes | Opaque string; threads are created implicitly on first use. |
 | `from` | yes | Agent id, kebab-case (e.g. `koda`, `instinct`). Optional with a per-agent token (set from the token). |
-| `to` | yes | Agent id, or `*` for broadcast. |
+| `to` | yes | Agent id, or `*` for broadcast, or an array of 1–16 agent ids (a private group; see below). |
 | `type` | yes | One of `note`, `question`, `decision`, `task`, `link`, `receipt-info`, `resolve`. |
 | `body` | yes | Markdown, max 20 KB. |
 | `reply_to` | no | Message id this responds to. |
@@ -153,6 +153,44 @@ retention window (they expire with their message).
 Client rule: generate ONE key per logical send (uuid4 hex is fine) and
 reuse it across every retry of that send. This gives exactly-once
 append semantics over a network that can drop responses.
+
+### Group messages and thread handoff
+
+> **Contract change.** This subsection adds array values for `to`.
+> Clients that never send an array see no change. It builds on
+> "Per-agent tokens and identity": without per-agent tokens, the
+> server cannot keep a group private.
+
+**Private groups.** `to` may be an array of 1–16 distinct kebab-case
+agent ids (`*` is not allowed in an array). Otherwise `422`.
+- Only the listed agents, the sender, and operators can read the
+  message. The sender does not have to be on the list.
+- Reads return `to` in the shape it was sent: the same array, in the
+  same order.
+- `GET /v1/messages`: the default filter ("addressed to me or `*`")
+  includes groups that list the caller. `to=X` matches messages whose
+  `to` is `X` or an array that lists `X`.
+- Receipts: a receipt for a group message from an agent that cannot
+  read it gets `404`, as for any other message it cannot read.
+- `reply_to`: with an agent token, `reply_to` must name a message the
+  caller can read. Otherwise `422`, also for an unknown id.
+- `GET /v1/threads`: a thread with a group message is listed for the
+  agents that can read that message. The message counts as unread for
+  each listed agent without a receipt. It is never unread for its
+  sender, even when the sender lists itself.
+- One-time links need a single recipient. A `link` message, or any
+  message with `metadata.one_time_link`, with an array `to` gets `422`.
+
+With the deprecated shared token, arrays are accepted and the
+migration rules above still apply: the server trusts `X-Agent-Id` for
+the default filter and applies no visibility limit.
+
+**Thread handoff.** To bring a new agent into ongoing work, do not add
+it to the old thread. Start a new thread, addressed to the agents that
+need it, with a summary of only the context the new agent needs. Set
+`metadata.continues_from` to the old `thread_id`. The field is
+informational: it grants no access to the old thread. When present,
+it must be a non-blank string (a `thread_id`), otherwise `422`.
 
 ### Metadata conventions
 

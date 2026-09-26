@@ -59,6 +59,7 @@ AGENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BODY_MAX_BYTES = 20 * 1024      # spec: body max 20 KB
 METADATA_MAX_BYTES = 16 * 1024  # spec: metadata max 16 KB serialized
 IDEMPOTENCY_KEY_MAX = 128       # spec: idempotency_key max 128 chars
+GROUP_MAX = 16                  # spec: a `to` array lists 1-16 agents
 RATE_LIMIT = 60             # requests (default; --rate-limit) ...
 RATE_WINDOW = 60.0          # ... per 60 seconds, per token
 LONG_POLL_MAX = 60
@@ -88,6 +89,14 @@ CREATE TABLE IF NOT EXISTS receipts (
     at         TEXT NOT NULL,
     PRIMARY KEY (message_id, agent)
 );
+-- group messages: one row per listed agent (recipient is '' for these)
+CREATE TABLE IF NOT EXISTS message_recipients (
+    message_id TEXT NOT NULL,
+    agent      TEXT NOT NULL,
+    PRIMARY KEY (message_id, agent)
+);
+CREATE INDEX IF NOT EXISTS idx_message_recipients_agent
+    ON message_recipients(agent, message_id);
 CREATE TABLE IF NOT EXISTS thread_status (
     thread_id   TEXT PRIMARY KEY,
     status      TEXT NOT NULL,          -- 'open' | 'resolved'
@@ -181,6 +190,23 @@ def valid_expires_at(value):
 
 def sha256_hex(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def group_error(to):
+    """Error text for a bad `to` array (a private group), or None."""
+    if not 1 <= len(to) <= GROUP_MAX:
+        return "to array must list 1-%d agent ids" % GROUP_MAX
+    if not all(isinstance(a, str) and AGENT_RE.fullmatch(a) for a in to):
+        return "to array must hold kebab-case agent ids (no '*')"
+    if len(set(to)) != len(to):
+        return "to array has duplicate agent ids"
+    return None
+
+
+def addressed_to(msg, agent):
+    """True when `msg` names `agent` as its recipient or a group member."""
+    to = msg["to"]
+    return agent in to if isinstance(to, list) else to == agent
 
 
 # --------------------------------------------------------------------------
@@ -306,6 +332,11 @@ class Store:
             if "idempotency_key" not in cols:
                 self._db.execute(
                     "ALTER TABLE messages ADD COLUMN idempotency_key TEXT")
+            # group messages: the `to` array as sent (NULL for a string
+            # `to`); members are also in message_recipients
+            if "recipients_json" not in cols:
+                self._db.execute(
+                    "ALTER TABLE messages ADD COLUMN recipients_json TEXT")
             # NULL keys never collide in a UNIQUE index, so plain posts
             # are unaffected; scoped per sender.
             self._db.execute(
@@ -313,18 +344,36 @@ class Store:
                 " ON messages(sender, idempotency_key)")
             self._db.commit()
 
+    # Addressed to an agent: the string recipient, or a member of the
+    # group. Takes the agent id twice. Every read path uses it.
+    ADDRESSED = ("(messages.recipient = ? OR EXISTS (SELECT 1 FROM"
+                 " message_recipients g WHERE g.message_id = messages.id"
+                 " AND g.agent = ?))")
+    # What an agent token may read: addressed to it, to '*', or its own.
+    VISIBLE = "(%s OR messages.recipient = '*' OR messages.sender = ?)" \
+        % ADDRESSED
+
     def add_message(self, msg_id, thread_id, sender, recipient, mtype,
                     body, reply_to, metadata, created_at,
                     idempotency_key=None):
+        """`recipient` is an agent id, '*', or a list (a private group)."""
+        group = recipient if isinstance(recipient, list) else None
         with self._lock:
             cur = self._db.execute(
                 "INSERT INTO messages (id, thread_id, sender, recipient, type,"
-                " body, reply_to, metadata, created_at, idempotency_key)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (msg_id, thread_id, sender, recipient, mtype, body, reply_to,
+                " body, reply_to, metadata, created_at, idempotency_key,"
+                " recipients_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (msg_id, thread_id, sender, "" if group else recipient,
+                 mtype, body, reply_to,
                  json.dumps(metadata) if metadata is not None else None,
-                 created_at, idempotency_key),
+                 created_at, idempotency_key,
+                 json.dumps(group) if group else None),
             )
+            if group:
+                self._db.executemany(
+                    "INSERT INTO message_recipients (message_id, agent)"
+                    " VALUES (?, ?)", [(msg_id, a) for a in group])
             self._db.commit()
             return cur.lastrowid
 
@@ -340,22 +389,24 @@ class Store:
     def list_messages(self, since_seq=0, thread_id=None, to=None,
                       caller=None, limit=50, visible_to=None):
         q = ("SELECT seq, id, thread_id, sender, recipient, type, body,"
-             " reply_to, metadata, created_at FROM messages WHERE seq > ?")
+             " reply_to, metadata, created_at, recipients_json"
+             " FROM messages WHERE seq > ?")
         args = [since_seq]
         if visible_to is not None:
-            # per-agent token: to me, to '*', or sent by me
-            q += " AND (recipient = ? OR recipient = '*' OR sender = ?)"
-            args += [visible_to, visible_to]
+            # per-agent token: to me (or my group), to '*', or sent by me
+            q += " AND " + self.VISIBLE
+            args += [visible_to] * 3
         if thread_id:
             q += " AND thread_id = ?"
             args.append(thread_id)
         if to is not None:
-            q += " AND recipient = ?"
-            args.append(to)
+            # `to=X`: X is the recipient or a member of the group
+            q += " AND " + self.ADDRESSED
+            args += [to, to]
         elif caller:
             # default: messages addressed to the caller, or broadcast
-            q += " AND (recipient = ? OR recipient = '*')"
-            args.append(caller)
+            q += " AND (%s OR recipient = '*')" % self.ADDRESSED
+            args += [caller, caller]
         q += " ORDER BY seq ASC LIMIT ?"
         args.append(limit)
         with self._lock:
@@ -367,7 +418,8 @@ class Store:
         with self._lock:
             row = self._db.execute(
                 "SELECT seq, id, thread_id, sender, recipient, type, body,"
-                " reply_to, metadata, created_at FROM messages WHERE id = ?",
+                " reply_to, metadata, created_at, recipients_json"
+                " FROM messages WHERE id = ?",
                 (msg_id,)).fetchone()
         if not row:
             return None
@@ -504,6 +556,9 @@ class Store:
                 self._db.execute(
                     "DELETE FROM receipts WHERE message_id NOT IN"
                     " (SELECT id FROM messages)")
+                self._db.execute(
+                    "DELETE FROM message_recipients WHERE message_id NOT IN"
+                    " (SELECT id FROM messages)")
             marked = 0
             rows = self._db.execute(
                 "SELECT id, metadata FROM messages"
@@ -531,9 +586,8 @@ class Store:
              " FROM messages GROUP BY thread_id")
         args = []
         if visible_to is not None:
-            q += (" HAVING SUM(recipient = ? OR recipient = '*'"
-                  " OR sender = ?) > 0")
-            args = [visible_to, visible_to]
+            q += " HAVING SUM(%s) > 0" % self.VISIBLE
+            args = [visible_to] * 3
         with self._lock:
             rows = self._db.execute(q + " ORDER BY mseq DESC",
                                     args).fetchall()
@@ -541,14 +595,19 @@ class Store:
                 for r in rows]
 
     def unread_count(self, thread_id, caller):
+        # A group message is never unread for its sender, even when the
+        # sender lists itself.
         with self._lock:
             row = self._db.execute(
-                "SELECT COUNT(*) AS n FROM messages m"
-                " WHERE m.thread_id = ?"
-                " AND (m.recipient = ? OR m.recipient = '*')"
+                "SELECT COUNT(*) AS n FROM messages"
+                " WHERE messages.thread_id = ?"
+                " AND (%s OR messages.recipient = '*')"
+                " AND NOT (messages.recipients_json IS NOT NULL"
+                "          AND messages.sender = ?)"
                 " AND NOT EXISTS (SELECT 1 FROM receipts r"
-                "                 WHERE r.message_id = m.id AND r.agent = ?)",
-                (thread_id, caller, caller)).fetchone()
+                "                 WHERE r.message_id = messages.id"
+                "                 AND r.agent = ?)" % self.ADDRESSED,
+                (thread_id, caller, caller, caller, caller)).fetchone()
         return row["n"]
 
     @staticmethod
@@ -563,7 +622,9 @@ class Store:
             "id": r["id"],
             "thread_id": r["thread_id"],
             "from": r["sender"],
-            "to": r["recipient"],
+            # a group's `to` comes back as the array that was sent
+            "to": json.loads(r["recipients_json"]) if r["recipients_json"]
+            else r["recipient"],
             "type": r["type"],
             "body": r["body"],
             "created_at": r["created_at"],
@@ -747,6 +808,12 @@ class Handler(BaseHTTPRequestHandler):
         """Agent id whose visibility limits reads, or None (no limit)."""
         return self.caller if self.role == "agent" else None
 
+    def _can_read(self, msg):
+        """May the caller read `msg`? Same rule as Store.VISIBLE."""
+        me = self._visible_to()
+        return me is None or msg["to"] == "*" or msg["from"] == me \
+            or addressed_to(msg, me)
+
     @staticmethod
     def _public(msg):
         msg = dict(msg)
@@ -810,15 +877,19 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_self(data, "from"):
             return
 
+        # `to` may also be an array of agent ids: a private group
+        group = data.get("to") if isinstance(data.get("to"), list) else None
         for field in ("thread_id", "from", "to", "type", "body"):
             val = data.get(field)
+            if field == "to" and group is not None:
+                continue
             if not isinstance(val, str) or not val.strip():
                 self._err(422, "%s is required" % field)
                 return
 
         thread_id = data["thread_id"].strip()
         sender = data["from"].strip()
-        recipient = data["to"].strip()
+        recipient = group if group is not None else data["to"].strip()
         mtype = data["type"].strip()
         body = data["body"]
         reply_to = data.get("reply_to")
@@ -828,7 +899,12 @@ class Handler(BaseHTTPRequestHandler):
         if not AGENT_RE.match(sender):
             self._err(422, "from must be a kebab-case agent id")
             return
-        if recipient != "*" and not AGENT_RE.match(recipient):
+        if group is not None:
+            err = group_error(group)
+            if err:
+                self._err(422, err)
+                return
+        elif recipient != "*" and not AGENT_RE.match(recipient):
             self._err(422, "to must be a kebab-case agent id or '*'")
             return
         if mtype not in MESSAGE_TYPES:
@@ -847,6 +923,18 @@ class Handler(BaseHTTPRequestHandler):
         if metadata is not None and \
                 len(json.dumps(metadata).encode("utf-8")) > METADATA_MAX_BYTES:
             self._err(413, "metadata exceeds 16 KB")
+            return
+        meta = metadata or {}
+        # thread handoff: informational only, grants no access
+        if "continues_from" in meta and (
+                not isinstance(meta["continues_from"], str)
+                or not meta["continues_from"].strip()):
+            self._err(422, "metadata.continues_from must be a thread_id")
+            return
+        if group is not None and (mtype == "link"
+                                  or "one_time_link" in meta):
+            self._err(422, "one-time links need a single recipient,"
+                           " not a to array")
             return
         if idempotency_key is not None:
             if not isinstance(idempotency_key, str) \
@@ -881,6 +969,13 @@ class Handler(BaseHTTPRequestHandler):
                     and not isinstance(link["consumed"], bool):
                 self._err(422, "metadata.one_time_link.consumed must be"
                                " a boolean")
+                return
+        if reply_to is not None and self._visible_to() is not None:
+            # agent token: only reply to a message you can read (an
+            # unknown id gets the same answer, so this reveals nothing)
+            parent = self.store.get_message(reply_to)
+            if parent is None or not self._can_read(parent):
+                self._err(422, "reply_to must be a message you can read")
                 return
 
         msg_id = new_id()
@@ -981,10 +1076,7 @@ class Handler(BaseHTTPRequestHandler):
                       % ", ".join(sorted(RECEIPT_STATUSES)))
             return
         msg = self.store.get_message(message_id)
-        me = self._visible_to()
-        if msg is None or (me is not None
-                           and me not in (msg["to"], msg["from"])
-                           and msg["to"] != "*"):
+        if msg is None or not self._can_read(msg):
             self._err(404, "unknown message_id")
             return
 

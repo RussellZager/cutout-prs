@@ -2,6 +2,7 @@
 // Wire-compatible with SPEC.md v1.1: same endpoints, fields, status codes.
 // Config via env only (no secrets in code): SUPABASE_DB_URL (auto).
 // Per-agent tokens live in cutout.agents (sha256 only; see agents.sql).
+// Group messages (`to` as an array) need groups.sql applied first.
 // CUTOUT_TOKEN, the shared token, is deprecated and optional.
 import postgres from "npm:postgres@3.4.5";
 const DB_URL = Deno.env.get("SUPABASE_DB_URL");
@@ -134,7 +135,7 @@ function serialize(m) {
     id: m.id,
     thread_id: m.thread_id,
     from: m.from_agent,
-    to: m.to_agent,
+    to: m.to_list ?? m.to_agent, // a group's `to` is the array sent
     type: m.type,
     body: m.body,
     reply_to: m.reply_to ?? null,
@@ -299,8 +300,19 @@ function checkSelf(caller: Caller, body: Record<string, unknown>, field: string)
   body[field] = caller.agentId;
   return null;
 }
-// Agent tokens read messages to them, to '*', or sent by them.
-const visible = (caller: Caller)=>caller.role === "agent" ? sql`and (to_agent = ${caller.agentId} or to_agent = '*' or from_agent = ${caller.agentId})` : sql``;
+// Addressed to an agent: the string recipient, or a member of the group
+// (to_list, see groups.sql). Every read path uses it.
+const addressed = (agent: string | null)=>sql`(to_agent = ${agent} or to_list @> array[${agent}]::text[])`;
+// Agent tokens read messages to them (or their group), to '*', or sent by them.
+const visible = (caller: Caller)=>caller.role === "agent" ? sql`and (${addressed(caller.agentId)} or to_agent = '*' or from_agent = ${caller.agentId})` : sql``;
+const GROUP_MAX = 16;
+const AGENT_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+function groupError(to: unknown[]) {
+  if (to.length < 1 || to.length > GROUP_MAX) return `to array must list 1-${GROUP_MAX} agent ids`;
+  if (!to.every((a)=>typeof a === "string" && AGENT_RE.test(a))) return "to array must hold kebab-case agent ids (no '*')";
+  if (new Set(to).size !== to.length) return "to array has duplicate agent ids";
+  return null;
+}
 // ---- handlers ---------------------------------------------------------------
 async function postMessage(req, caller: Caller) {
   let body;
@@ -313,6 +325,14 @@ async function postMessage(req, caller: Caller) {
   }
   const forbidden = checkSelf(caller, body, "from");
   if (forbidden) return forbidden;
+  // `to` may also be an array of agent ids: a private group
+  const group: string[] | null = Array.isArray(body.to) ? body.to : null;
+  if (group) {
+    const err = groupError(group);
+    if (err) return jres(422, {
+      error: err
+    });
+  }
   for (const f of [
     "thread_id",
     "from",
@@ -320,6 +340,7 @@ async function postMessage(req, caller: Caller) {
     "type",
     "body"
   ]){
+    if (f === "to" && group) continue;
     if (typeof body[f] !== "string" || body[f].length === 0) {
       return jres(422, {
         error: `${f} is required`
@@ -362,6 +383,17 @@ async function postMessage(req, caller: Caller) {
   if (linkErr) return jres(422, {
     error: linkErr
   });
+  // thread handoff: informational only, grants no access
+  if ("continues_from" in metadata && (typeof metadata.continues_from !== "string" || metadata.continues_from.trim().length === 0)) {
+    return jres(422, {
+      error: "metadata.continues_from must be a thread_id"
+    });
+  }
+  if (group && (body.type === "link" || "one_time_link" in metadata)) {
+    return jres(422, {
+      error: "one-time links need a single recipient, not a to array"
+    });
+  }
   let idemKey = null;
   if (body.idempotency_key !== undefined && body.idempotency_key !== null) {
     if (typeof body.idempotency_key !== "string" || body.idempotency_key.length === 0 || body.idempotency_key.length > MAX_IDEMPOTENCY_KEY) {
@@ -384,13 +416,21 @@ async function postMessage(req, caller: Caller) {
     created_at: iso(dup[0].created_at),
     duplicate: true
   });
+  if (body.reply_to !== undefined && body.reply_to !== null && caller.role === "agent") {
+    // Agent token: only reply to a message you can read (an unknown id gets
+    // the same answer, so this reveals nothing).
+    const parent = await timedQuery(sql`select 1 from cutout.messages where id = ${body.reply_to} ${visible(caller)}`, "reply_to_visible");
+    if (parent.length === 0) return jres(422, {
+      error: "reply_to must be a message you can read"
+    });
+  }
   const id = "msg_" + ulid();
   try {
     const rows = await timedQuery(sql.begin(async (tx)=>{
       const r = await tx`
-        insert into cutout.messages (id, thread_id, from_agent, to_agent, type, body, reply_to, metadata)
-        values (${id}, ${body.thread_id}, ${from}, ${body.to},
-                ${body.type}, ${body.body},
+        insert into cutout.messages (id, thread_id, from_agent, to_agent, to_list, type, body, reply_to, metadata)
+        values (${id}, ${body.thread_id}, ${from}, ${group ? "" : body.to},
+                ${group ? sql.array(group) : null}, ${body.type}, ${body.body},
                 ${body.reply_to ?? null}, ${sql.json(metadata)})
         returning id, created_at`;
       if (idemKey !== null) {
@@ -445,13 +485,13 @@ async function getMessages(req, arrivedAt, caller: Caller) {
   }
   const queryOnce = async ()=>{
     const q = sql`
-      select id, thread_id, from_agent, to_agent, type, body, reply_to, created_at,
+      select id, thread_id, from_agent, to_agent, to_list, type, body, reply_to, created_at,
              (extract(epoch from created_at) * 1000000)::bigint as created_us, metadata
       from cutout.messages
       where true ${visible(caller)}
       ${cursor ? sql`and ((extract(epoch from created_at) * 1000000)::bigint > ${cursor.us} or ((extract(epoch from created_at) * 1000000)::bigint = ${cursor.us} and id > ${cursor.id}))` : sql``}
       ${threadId ? sql`and thread_id = ${threadId}` : sql``}
-      ${to ? sql`and to_agent = ${to}` : agentId ? sql`and (to_agent = ${agentId} or to_agent = '*')` : sql``}
+      ${to ? sql`and ${addressed(to)}` : agentId ? sql`and (${addressed(agentId)} or to_agent = '*')` : sql``}
       order by created_at asc, id asc
       limit ${limit}`;
     return await timedQuery(q, "query_once");
@@ -557,12 +597,14 @@ async function getThreads(req, caller: Caller) {
     select m.thread_id, max(m.created_at) as last_at,
       (array_agg(m.type order by m.created_at desc, m.id desc))[1] as last_type,
       ${agentId ? sql`count(*) filter (
-        where (m.to_agent = ${agentId} or m.to_agent = '*')
+        where (${addressed(agentId)} or m.to_agent = '*')
+          -- a group message is never unread for its sender
+          and not (m.to_list is not null and m.from_agent = ${agentId})
           and not exists (select 1 from cutout.receipts r where r.message_id = m.id and r.agent = ${agentId})
       )::int` : sql`0`} as unread
     from cutout.messages m
     group by m.thread_id
-    ${caller.role === "agent" ? sql`having bool_or(m.to_agent = ${agentId} or m.to_agent = '*' or m.from_agent = ${agentId})` : sql``}
+    ${caller.role === "agent" ? sql`having bool_or(${addressed(agentId)} or m.to_agent = '*' or m.from_agent = ${agentId})` : sql``}
     order by last_at desc`, "threads");
   return jres(200, {
     // Resolved iff the latest message is a resolve; any later non-resolve message reopens.

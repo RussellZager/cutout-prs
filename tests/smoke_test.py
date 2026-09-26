@@ -23,6 +23,8 @@ then exercises every endpoint and asserts the key behaviors:
   - 413 on oversize body / metadata
   - default `to` filtering via X-Agent-Id
   - thread list with per-agent unread counts
+  - group messages (`to` as an array): visibility, filters, receipts,
+    reply_to, validation, and the thread-handoff convention
   - 429 + Retry-After at the default limit of 60 (own server; the
     main server runs with a high limit so tests do not share a budget)
 
@@ -858,6 +860,269 @@ class AgentTokenTest(unittest.TestCase):
         listed = {a["agent_id"]: a
                   for a in json.loads(self.cli("list").stdout)}
         self.assertIsNotNone(listed["temp"]["revoked_at"])
+
+
+class _GroupServer(object):
+    """A server with per-agent tokens (and the legacy shared token) for
+    group-message tests. Each subclass gets its own server and rate
+    budget."""
+
+    LEGACY = "legacy-shared-token"
+    TOKENS = {"koda": "koda-token", "instinct": "instinct-token",
+              "third": "third-token", "outsider": "outsider-token",
+              "newbie": "newbie-token", "ops": "ops-token"}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = free_port()
+        cls.base_url = "http://127.0.0.1:%d" % cls.port
+        cls.tmp = tempfile.TemporaryDirectory()
+        agents_file = os.path.join(cls.tmp.name, "agents.json")
+        with open(agents_file, "w") as fh:
+            json.dump({a: {"token_sha256":
+                           hashlib.sha256(t.encode()).hexdigest(),
+                           "role": "operator" if a == "ops" else "agent",
+                           "revoked_at": None}
+                       for a, t in cls.TOKENS.items()}, fh)
+        env = dict(os.environ, CUTOUT_TOKEN=cls.LEGACY,
+                   CUTOUT_AGENTS_FILE=agents_file)
+        cls.proc = subprocess.Popen(
+            [sys.executable, SERVER, "--port", str(cls.port),
+             "--db", os.path.join(cls.tmp.name, "groups.db")],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                st, _, _ = raw_request(cls.base_url, "GET", "/health")
+                if st == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("server did not start")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait()
+        cls.tmp.cleanup()
+
+    def req(self, agent, method, path, **kw):
+        return raw_request(self.base_url, method, path,
+                           token=self.TOKENS[agent], **kw)
+
+    def post(self, agent, **fields):
+        msg = {"thread_id": "grp", "to": ["instinct", "third"],
+               "type": "note", "body": "hi"}
+        msg.update(fields)
+        return self.req(agent, "POST", "/v1/messages", body=msg)
+
+    def messages(self, agent, **params):
+        st, _, body = self.req(agent, "GET", "/v1/messages", params=params)
+        self.assertEqual(st, 200, body)
+        return body["messages"]
+
+    def bodies(self, agent, **params):
+        return [m["body"] for m in self.messages(agent, **params)]
+
+    def threads(self, agent):
+        st, _, body = self.req(agent, "GET", "/v1/threads")
+        self.assertEqual(st, 200, body)
+        return {t["thread_id"]: t for t in body["threads"]}
+
+
+class GroupMessageTest(_GroupServer, unittest.TestCase):
+    """`to` as an array: a private group. Only the listed agents, the
+    sender, and operators can read it."""
+
+    def test_members_sender_and_operator_read_it_others_cannot(self):
+        st, _, _ = self.post("koda", thread_id="grp-vis", body="for two")
+        self.assertEqual(st, 201)
+        # members see it in their default poll
+        self.assertEqual(self.bodies("instinct", thread_id="grp-vis"),
+                         ["for two"])
+        self.assertEqual(self.bodies("third", thread_id="grp-vis"),
+                         ["for two"])
+        # an agent not on the list sees nothing, by any route
+        self.assertEqual(self.bodies("outsider", thread_id="grp-vis"), [])
+        self.assertEqual(self.bodies("outsider", thread_id="grp-vis",
+                                     to="instinct"), [])
+        self.assertNotIn("grp-vis", self.threads("outsider"))
+        # the sender and an operator can read it
+        self.assertEqual(self.bodies("koda", thread_id="grp-vis",
+                                     to="third"), ["for two"])
+        self.assertEqual(self.bodies("ops", thread_id="grp-vis"),
+                         ["for two"])
+
+    def test_to_filter_matches_listed_agents(self):
+        self.post("koda", thread_id="grp-filter", body="group")
+        self.post("koda", thread_id="grp-filter", to="third", body="dm")
+        self.post("koda", thread_id="grp-filter", to="*", body="all")
+        # `to=X`: X is on the list, or X is the string recipient
+        self.assertEqual(self.bodies("ops", thread_id="grp-filter",
+                                     to="third"), ["group", "dm"])
+        self.assertEqual(self.bodies("ops", thread_id="grp-filter",
+                                     to="instinct"), ["group"])
+        self.assertEqual(self.bodies("ops", thread_id="grp-filter",
+                                     to="outsider"), [])
+        # a member filtering on another member still sees the group
+        self.assertEqual(self.bodies("instinct", thread_id="grp-filter",
+                                     to="third"), ["group"])
+
+    def test_receipts_and_unread(self):
+        st, _, body = self.post("koda", thread_id="grp-rcpt",
+                                to=["koda", "instinct"], body="ack me")
+        self.assertEqual(st, 201, body)
+        mid = body["id"]
+        self.assertEqual(self.threads("instinct")["grp-rcpt"]["unread"], 1)
+        # the sender listed itself, but its own message is never unread
+        self.assertEqual(self.threads("koda")["grp-rcpt"]["unread"], 0)
+        st, _, _ = self.req("outsider", "POST", "/v1/receipts",
+                            body={"message_id": mid, "status": "received"})
+        self.assertEqual(st, 404)
+        st, _, _ = self.req("instinct", "POST", "/v1/receipts",
+                            body={"message_id": mid, "status": "received"})
+        self.assertEqual(st, 201)
+        self.assertEqual(self.threads("instinct")["grp-rcpt"]["unread"], 0)
+        got = self.messages("instinct", thread_id="grp-rcpt")
+        self.assertEqual([(r["agent"], r["status"])
+                          for r in got[0]["receipts"]],
+                         [("instinct", "received")])
+
+    def test_reply_to_needs_a_readable_message(self):
+        st, _, body = self.post("koda", thread_id="grp-reply", body="q?")
+        self.assertEqual(st, 201, body)
+        mid = body["id"]
+        st, _, _ = self.post("instinct", thread_id="grp-reply",
+                             to=["koda", "third"], reply_to=mid, body="a")
+        self.assertEqual(st, 201)
+        st, _, err = self.post("outsider", thread_id="grp-reply",
+                               to="koda", reply_to=mid, body="butting in")
+        self.assertEqual(st, 422, err)
+        # an unknown id gets the same answer as an unreadable one
+        st, _, err2 = self.post("outsider", thread_id="grp-reply",
+                                to="koda", reply_to="msg_nope", body="x")
+        self.assertEqual((st, err2), (422, err))
+
+    def test_to_is_echoed_in_the_shape_sent(self):
+        self.post("koda", thread_id="grp-shape", to=["third", "instinct"],
+                  body="array")
+        self.post("koda", thread_id="grp-shape", to="third", body="string")
+        got = self.messages("third", thread_id="grp-shape")
+        self.assertEqual([m["to"] for m in got],
+                         [["third", "instinct"], "third"])
+
+    def test_handoff_new_thread_does_not_open_the_old_one(self):
+        st, _, body = self.post("koda", thread_id="grp-old",
+                                to=["instinct"], body="old detail")
+        self.assertEqual(st, 201, body)
+        old_id = body["id"]
+        self.post("instinct", thread_id="grp-old", to="koda",
+                  body="old reply")
+        st, _, _ = self.post(
+            "koda", thread_id="grp-new", to=["instinct", "newbie"],
+            body="summary: what you need", metadata={
+                "continues_from": "grp-old"})
+        self.assertEqual(st, 201)
+        got = self.messages("newbie", thread_id="grp-new")
+        self.assertEqual(got[0]["metadata"], {"continues_from": "grp-old"})
+        # continues_from is informational: the old thread stays closed
+        self.assertEqual(self.bodies("newbie", thread_id="grp-old"), [])
+        self.assertNotIn("grp-old", self.threads("newbie"))
+        st, _, _ = self.req("newbie", "POST", "/v1/receipts",
+                            body={"message_id": old_id,
+                                  "status": "received"})
+        self.assertEqual(st, 404)
+        st, _, _ = self.post("newbie", thread_id="grp-old", to="koda",
+                             reply_to=old_id, body="let me in")
+        self.assertEqual(st, 422)
+
+
+class GroupValidationTest(_GroupServer, unittest.TestCase):
+    """Group validation, the legacy token, and in-place migration."""
+
+    def test_bad_to_arrays_rejected(self):
+        many = ["agent-%d" % i for i in range(17)]
+        for to in ([], many, ["instinct", "instinct"], ["*"],
+                   ["instinct", 7], ["Not Kebab"], ["instinct\n"]):
+            st, _, body = self.post("koda", thread_id="grp-bad", to=to)
+            self.assertEqual(st, 422, (to, body))
+        # 16 distinct agents is the limit, and fine
+        st, _, _ = self.post("koda", thread_id="grp-bad", to=many[:16])
+        self.assertEqual(st, 201)
+
+    def test_one_time_links_need_a_single_recipient(self):
+        link = {"one_time_link": {"url": "https://example.com/once",
+                                  "expires_at": "2030-01-01T00:00:00Z",
+                                  "consumed": False}}
+        st, _, _ = self.post("koda", thread_id="grp-link", type="link",
+                             body="link", metadata=link)
+        self.assertEqual(st, 422)
+        st, _, _ = self.post("koda", thread_id="grp-link", metadata=link)
+        self.assertEqual(st, 422)
+        st, _, _ = self.post("koda", thread_id="grp-link", type="link",
+                             to="instinct", body="link", metadata=link)
+        self.assertEqual(st, 201)
+        st, _, _ = self.post("koda", thread_id="grp-link", body="no link")
+        self.assertEqual(st, 201)
+
+    def test_continues_from_must_be_a_thread_id(self):
+        for bad in ("", "  ", 7, None, ["grp-old"]):
+            st, _, _ = self.post("koda", thread_id="grp-cf", to="instinct",
+                                 metadata={"continues_from": bad})
+            self.assertEqual(st, 422, bad)
+        st, _, _ = self.post("koda", thread_id="grp-cf", to="instinct",
+                             metadata={"continues_from": "grp-old"})
+        self.assertEqual(st, 201)
+
+    def test_legacy_token_can_address_a_group(self):
+        st, _, _ = raw_request(
+            self.base_url, "POST", "/v1/messages", token=self.LEGACY,
+            body={"thread_id": "grp-legacy", "from": "old-agent",
+                  "to": ["old-peer"], "type": "note", "body": "legacy grp"})
+        self.assertEqual(st, 201)
+        # the legacy default filter ("to me or *") includes my groups
+        for agent_id, want in (("old-peer", ["legacy grp"]),
+                               ("old-other", [])):
+            st, _, body = raw_request(
+                self.base_url, "GET", "/v1/messages", token=self.LEGACY,
+                agent_id=agent_id, params={"thread_id": "grp-legacy"})
+            self.assertEqual([m["body"] for m in body["messages"]], want)
+
+    def test_existing_database_is_migrated_in_place(self):
+        sys.path.insert(0, os.path.dirname(SERVER))
+        import cutout_server
+        db = os.path.join(self.tmp.name, "old.db")
+        old = sqlite3.connect(db)
+        old.executescript(
+            "CREATE TABLE messages (seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " id TEXT NOT NULL UNIQUE, thread_id TEXT NOT NULL,"
+            " sender TEXT NOT NULL, recipient TEXT NOT NULL,"
+            " type TEXT NOT NULL, body TEXT NOT NULL, reply_to TEXT,"
+            " metadata TEXT, created_at TEXT NOT NULL);"
+            "INSERT INTO messages (id, thread_id, sender, recipient, type,"
+            " body, created_at) VALUES ('msg_old', 't', 'koda', 'instinct',"
+            " 'note', 'before', '2030-01-01T00:00:00Z');")
+        old.commit()
+        old.close()
+        store = cutout_server.Store(db)
+        conn = sqlite3.connect(db)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)")]
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")]
+        conn.close()
+        self.assertIn("recipients_json", cols)
+        self.assertIn("message_recipients", tables)
+        store.add_message("msg_new", "t", "koda", ["instinct", "third"],
+                          "note", "after", None, None,
+                          "2030-01-01T00:00:01Z")
+        self.assertEqual([(m["body"], m["to"]) for m in
+                          store.list_messages(to="instinct")],
+                         [("before", "instinct"),
+                          ("after", ["instinct", "third"])])
+        self.assertEqual([m["body"] for m in
+                          store.list_messages(to="third")], ["after"])
 
 
 if __name__ == "__main__":

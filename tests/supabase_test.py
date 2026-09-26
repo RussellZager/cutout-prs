@@ -2,7 +2,8 @@
 """Project Cutout — edge function + SQL test (optional, local only).
 
 Starts a throwaway PostgreSQL cluster on a free port, applies
-supabase/schema.sql (pg_cron statements removed) and schema_v1.1.sql,
+supabase/schema.sql (pg_cron statements removed), schema_v1.1.sql,
+agents.sql and groups.sql,
 serves supabase/index.ts with Deno, and holds both to the same
 one-time link cases the reference server meets in tests/smoke_test.py:
 
@@ -97,9 +98,12 @@ class EdgeFunctionTest(unittest.TestCase):
             raise AssertionError("pg_cron block not found in schema.sql")
         base = base[:base.index(CRON_MARKER)]
         assert "cron." not in base, "pg_cron left in schema.sql"
-        with open(os.path.join(ROOT, "supabase", "schema_v1.1.sql")) as fh:
-            migration = fh.read()
-        for sql in (base, migration):
+        migrations = []
+        # deploy order from supabase/README.md
+        for name in ("schema_v1.1.sql", "agents.sql", "groups.sql"):
+            with open(os.path.join(ROOT, "supabase", name)) as fh:
+                migrations.append(fh.read())
+        for sql in [base] + migrations:
             path = os.path.join(cls.tmp.name, "schema.sql")
             with open(path, "w") as fh:
                 fh.write(sql)
