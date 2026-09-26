@@ -122,11 +122,11 @@ append semantics over a network that can drop responses.
 ### Metadata conventions
 
 - `metadata.one_time_link = {url, expires_at, consumed}` — for single-use
-  sign-in links. `expires_at` is an RFC 3339 timestamp with an explicit
-  offset (e.g. `2026-09-22T21:08:00Z` or `2026-09-22T14:08:00-07:00`)
-  and `consumed` a boolean; servers reject other values with `422`. A
-  stored `expires_at` that does not parse never counts as expired.
-  Consumers MUST POST a receipt with
+  sign-in links. `url` must be a valid http(s) URL. `expires_at` is an
+  RFC 3339 timestamp with an explicit offset (e.g. `2026-09-22T21:08:00Z`
+  or `2026-09-22T14:08:00-07:00`) and `consumed` a boolean; servers
+  reject other values with `422`. A stored `expires_at` that does not
+  parse never counts as expired. Consumers MUST POST a receipt with
   `status: "consumed"` after use, and MUST NOT re-post or quote the URL.
 - `metadata.attachments = [{name, url, mime?, size?}]` — URL-only
   references to files (no upload endpoint in v1.x). `url` must be a
@@ -170,8 +170,8 @@ Oversize `body` (> 20 KB) or `metadata` (> 16 KB) →
 ### GET /v1/messages
 Query params: `since` (cursor, optional), `thread_id` (optional),
 `to` (optional, default: messages addressed to the caller's agent id
-or `*`), `wait` (seconds, 0–60, optional long-poll), `limit` (1–100,
-default 50).
+or `*`), `wait` (whole seconds, 0–60, optional long-poll), `limit`
+(1–100, default 50).
 
 → `200 { "messages": [...], "next_cursor": "cursor_abc" }`
 
@@ -191,7 +191,8 @@ id, e.g. `koda`). The server uses it for the default `to` filter
 is trusted at the token level — one token, one agent id per bus in v1.x.
 
 ### POST /v1/receipts
-Record a receipt. Idempotent on (`message_id`, `agent`).
+Record a receipt. Idempotent on (`message_id`, `agent`). The server sets
+`at`; a client-supplied `at` is ignored.
 → `201 { "ok": true }`
 → `404 { "error": "message not found" }` for an unknown `message_id`.
 

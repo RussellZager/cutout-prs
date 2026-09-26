@@ -688,5 +688,85 @@ class UnauthenticatedRateLimitTest(unittest.TestCase):
         self.assertEqual(h.get("x-ratelimit-remaining"), "59")
 
 
+class ParityTest(unittest.TestCase):
+    """Behaviors both servers must share. Own server, so the main suite's
+    rate-limit budget is untouched."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = free_port()
+        cls.base_url = "http://127.0.0.1:%d" % cls.port
+        cls.tmp = tempfile.TemporaryDirectory()
+        db = os.path.join(cls.tmp.name, "smoke.db")
+        env = dict(os.environ, CUTOUT_TOKEN=TOKEN)
+        cls.proc = subprocess.Popen(
+            [sys.executable, SERVER, "--port", str(cls.port), "--db", db],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                st, _, _ = raw_request(cls.base_url, "GET", "/health")
+                if st == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("server did not start")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait()
+        cls.tmp.cleanup()
+
+    def _post(self, path, body):
+        st, _, out = raw_request(self.base_url, "POST", path, token=TOKEN,
+                                 body=body)
+        return st, out
+
+    def test_one_time_link_url_must_be_http(self):
+        def link(url):
+            return {"thread_id": "smoke-link-url", "from": "koda",
+                    "to": "instinct", "type": "link", "body": "link inside",
+                    "metadata": {"one_time_link": {"url": url}}}
+        for url in ("javascript:alert(1)", "data:text/html,hi",
+                    "file:///etc/hosts"):
+            st, out = self._post("/v1/messages", link(url))
+            with self.subTest(url):
+                self.assertEqual(st, 422, out)
+        st, out = self._post("/v1/messages",
+                             link("https://example.com/auth?t=1"))
+        self.assertEqual(st, 201, out)
+
+    def test_timestamps_are_server_set_milliseconds(self):
+        # SPEC timestamps are UTC with a Z; both servers send exactly three
+        # fractional digits
+        ms = r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$"
+        st, posted = self._post("/v1/messages", {
+            "thread_id": "smoke-ts", "from": "koda", "to": "instinct",
+            "type": "note", "body": "what time is it"})
+        self.assertEqual(st, 201, posted)
+        self.assertRegex(posted["created_at"], ms)
+        # a client-supplied receipt `at` is ignored: the server sets it
+        st, out = self._post("/v1/receipts", {
+            "message_id": posted["id"], "agent": "instinct",
+            "status": "received", "at": "1999-01-01T00:00:00Z"})
+        self.assertEqual(st, 201, out)
+        st, _, got = raw_request(self.base_url, "GET", "/v1/messages",
+                                 token=TOKEN, agent_id="instinct",
+                                 params={"thread_id": "smoke-ts"})
+        m = got["messages"][0]
+        self.assertEqual(m["created_at"], posted["created_at"])
+        self.assertRegex(m["receipts"][0]["at"], ms)
+        self.assertGreaterEqual(m["receipts"][0]["at"], m["created_at"])
+
+    def test_wait_must_be_integer(self):
+        st, _, out = raw_request(self.base_url, "GET", "/v1/messages",
+                                 token=TOKEN, agent_id="instinct",
+                                 params={"wait": "1.5"})
+        self.assertEqual(st, 422, out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

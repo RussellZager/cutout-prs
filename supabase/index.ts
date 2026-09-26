@@ -248,6 +248,19 @@ function validOneTimeLink(link: unknown) {
   }
   return null;
 }
+// metadata.one_time_link.url, when present, must be http(s) (as for attachments).
+function validLinkUrl(link: unknown) {
+  if (typeof link !== "object" || link === null || Array.isArray(link)) return true;
+  const url = (link as Record<string, unknown>).url;
+  if (url === undefined || url === null) return true;
+  if (typeof url !== "string") return false;
+  try {
+    const p = new URL(url).protocol;
+    return p === "https:" || p === "http:";
+  } catch  {
+    return false;
+  }
+}
 // ---- handlers ---------------------------------------------------------------
 async function postMessage(req) {
   let body;
@@ -301,6 +314,11 @@ async function postMessage(req) {
     const err = validAttachments(metadata.attachments);
     if (err) return jres(422, {
       error: err
+    });
+  }
+  if (!validLinkUrl(metadata.one_time_link)) {
+    return jres(422, {
+      error: "metadata.one_time_link.url must be an http(s) URL"
     });
   }
   const linkErr = validOneTimeLink(metadata.one_time_link);
@@ -370,7 +388,7 @@ async function getMessages(req, arrivedAt) {
   let wait = 0, limit = 50;
   if (u.searchParams.has("wait")) {
     wait = Number(u.searchParams.get("wait"));
-    if (!Number.isFinite(wait) || wait < 0 || wait > 60) return jres(422, {
+    if (!Number.isInteger(wait) || wait < 0 || wait > 60) return jres(422, {
       error: "wait must be between 0 and 60"
     });
   }
@@ -469,13 +487,9 @@ async function postReceipt(req) {
       error: `status must be one of ${RECEIPT_STATUSES.join(", ")}`
     });
   }
-  let at = new Date();
-  if (body.at !== undefined && body.at !== null) {
-    at = new Date(body.at);
-    if (Number.isNaN(at.getTime())) return jres(422, {
-      error: "at must be an ISO 8601 timestamp"
-    });
-  }
+  // The server sets `at`, as it sets a message's created_at; a client
+  // value is ignored (it could backdate the receipt).
+  const at = new Date();
   const mid = body.message_id, agent = body.agent, status = body.status;
   const exists = await timedQuery(sql`select metadata from cutout.messages where id = ${mid}`, "receipt_exists");
   if (exists.length === 0) return jres(404, {

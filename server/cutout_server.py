@@ -95,8 +95,25 @@ CREATE TABLE IF NOT EXISTS thread_status (
 # small helpers
 # --------------------------------------------------------------------------
 
+def iso_ms(dt):
+    """UTC timestamp with exactly 3 fractional digits and a Z, the same
+    format the edge function sends (e.g. 2026-09-22T20:35:00.000Z)."""
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def utcnow():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return iso_ms(datetime.now(timezone.utc))
+
+
+def http_url(value):
+    """True for an absolute http(s) URL."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parts = urlparse(value)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
 def new_id(prefix="msg_"):
@@ -370,8 +387,7 @@ class Store:
         (by created_at) and mark any expired one_time_link entries as
         consumed (URL erased) on the survivors.
         Returns (deleted, links_marked)."""
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)) \
-            .isoformat().replace("+00:00", "Z")
+        cutoff = iso_ms(datetime.now(timezone.utc) - timedelta(days=days))
         now = datetime.now(timezone.utc)
         with self._lock:
             doomed = self._db.execute(
@@ -670,6 +686,12 @@ class Handler(BaseHTTPRequestHandler):
         if metadata is not None and \
                 len(json.dumps(metadata).encode("utf-8")) > METADATA_MAX_BYTES:
             self._err(413, "metadata exceeds 16 KB")
+            return
+        link = (metadata or {}).get("one_time_link")
+        if isinstance(link, dict) and link.get("url") is not None \
+                and not http_url(link["url"]):
+            self._err(422, "metadata.one_time_link.url must be an http(s)"
+                           " URL")
             return
         if idempotency_key is not None:
             if not isinstance(idempotency_key, str) \
