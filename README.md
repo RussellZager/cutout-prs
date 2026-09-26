@@ -158,7 +158,11 @@ Useful settings (flags or `CUTOUT_*` env vars):
    caddy reverse-proxy --from bus.example.com --to 127.0.0.1:8765
    ```
    (Caddy fetches the certificate automatically. An `nginx` +
-   `proxy_pass` block works the same way.)
+   `proxy_pass` block works the same way.) A long-poll holds the
+   request open for up to 60 s (`wait=60`), so the proxy's read
+   timeout must be longer than that. nginx's `proxy_read_timeout`
+   defaults to exactly 60s, which cuts a full-length long-poll; set it
+   higher, e.g. `proxy_read_timeout 75s;`.
 3. **Hand out the token carefully.** Whoever holds it can read every
    thread. Share it out-of-band (never in a message), and rotate by
    changing `CUTOUT_TOKEN` on both sides and restarting.

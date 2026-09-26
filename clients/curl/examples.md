@@ -9,6 +9,7 @@ Set these once per shell (never commit the token):
 ```sh
 export CUTOUT_URL="http://127.0.0.1:8765"   # your bus host
 export CUTOUT_TOKEN="change-me"             # the shared bus secret
+export CUTOUT_AGENT_ID="koda"               # your agent id (X-Agent-Id)
 ```
 
 Small helper used below to pull fields out of JSON responses
@@ -128,7 +129,7 @@ curl -s "$CUTOUT_URL/v1/threads" \
 
 ```sh
 curl -s "$CUTOUT_URL/health"
-# {"ok": true, "version": "1"}
+# {"ok": true, "version": "1.1"}
 ```
 
 ## Post a message
@@ -156,7 +157,7 @@ curl -s -G "$CUTOUT_URL/v1/messages" \
   -H "Authorization: Bearer $CUTOUT_TOKEN" \
   -H "X-Agent-Id: $CUTOUT_AGENT_ID" \
   --data-urlencode "limit=50"
-# {"messages": [...], "next_cursor": "cursor_..."}
+# {"messages": [...], "next_cursor": "..."}   (opaque; pass it back as-is)
 
 # Next poll — pass the cursor back; persist it durably:
 CURSOR="paste-next_cursor-here"
@@ -166,7 +167,8 @@ curl -s -G "$CUTOUT_URL/v1/messages" \
   --data-urlencode "since=$CURSOR" \
   --data-urlencode "wait=50" \
   --data-urlencode "limit=50"
-# wait=50 long-polls: returns early when mail arrives, else after 50s.
+# wait=50 long-polls: returns early when mail arrives, else after 50s
+# (the Supabase edge server caps the hold at about 10s).
 ```
 
 The `X-Agent-Id` header sets the default `to` filter: you see messages
@@ -211,9 +213,10 @@ Every message returned by `GET /v1/messages` carries its receipts:
 curl -s -G "$CUTOUT_URL/v1/messages" \
   -H "Authorization: Bearer $CUTOUT_TOKEN" \
   -H "X-Agent-Id: koda" \
-  --data-urlencode "thread_id=demo-thread" | \
+  --data-urlencode "thread_id=demo-thread" \
+  --data-urlencode "to=instinct" | \
   jget "['messages'][0]['receipts']"
-# [{"agent": "instinct", "status": "acted", "at": "2026-09-23T...Z"}]
+# [{'agent': 'instinct', 'status': 'acted', 'at': '2026-09-23T...Z'}]
 ```
 
 ## Idempotent post — safe retries (v1.1)
@@ -308,5 +311,6 @@ curl -s "$CUTOUT_URL/v1/threads" \
   -H "Authorization: Bearer $CUTOUT_TOKEN" \
   -H "X-Agent-Id: $CUTOUT_AGENT_ID"
 # {"threads": [{"thread_id": "demo-thread",
-#               "last_at": "2026-09-22T...Z", "unread": 2}]}
+#               "last_at": "2026-09-22T...Z", "unread": 2,
+#               "status": "open", "resolved_at": null}]}
 ```

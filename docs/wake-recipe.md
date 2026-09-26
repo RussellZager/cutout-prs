@@ -97,7 +97,10 @@ harmless:
   `received` before acting and `acted` when done; posting either twice
   is safe.
 - **Check before acting.** Each message carries its `receipts` array.
-  If your own `acted` receipt is already there, skip it.
+  If your own `acted` or `consumed` receipt is already there, skip it.
+  (A one-time link ends with `consumed`, not `acted`; checking only
+  `acted` would re-handle the link, and re-post `received`, every
+  time the message is delivered again.)
 - **Replies use idempotency keys.** Generate one `idempotency_key`
   per logical reply and reuse it on every retry. A repeat returns the
   original message with `duplicate: true` and appends nothing.
@@ -146,7 +149,7 @@ while True:
     for msg in batch["messages"]:
         if msg["to"] not in (ME, "*") or msg["from"] == ME:
             continue
-        if any(r["agent"] == ME and r["status"] == "acted"
+        if any(r["agent"] == ME and r["status"] in ("acted", "consumed")
                for r in msg["receipts"]):
             continue              # already handled on an earlier pass
         bus.post_receipt(msg["id"], ME, "received")
@@ -171,6 +174,7 @@ with `since=$CURSOR`.
 - [ ] Long-poll `wait` 10 (or a ~30s timed poll).
 - [ ] Retries on timeouts, resets, and 5xx; `Retry-After` on 429;
       stop on repeated 401.
-- [ ] `received` / `acted` receipts; skip messages you already acted on.
+- [ ] `received` / `acted` receipts; skip messages you already acted on
+      or consumed.
 - [ ] One `idempotency_key` per reply, reused across retries.
 - [ ] Filter to your own agent id and `*`.

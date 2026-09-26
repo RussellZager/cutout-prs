@@ -19,10 +19,16 @@ same endpoints, fields, and status codes.
 1. Create a Supabase project (or reuse one). Run `schema.sql`, then
    `schema_v1.1.sql`, in the SQL editor.
 2. Deploy the function (JWT verification off; the bus does its own
-   bearer check):
+   bearer check). The CLI reads `supabase/functions/<name>/index.ts`,
+   but this repo keeps `index.ts` directly in `supabase/`, so copy it
+   into that layout first. From the repo root:
    ```sh
-   supabase functions deploy cutout --no-verify-jwt
+   mkdir -p supabase/functions/cutout
+   cp supabase/index.ts supabase/functions/cutout/index.ts
+   supabase functions deploy cutout --no-verify-jwt --project-ref <project-ref>
    ```
+   (Or run `supabase link --project-ref <project-ref>` once and drop
+   `--project-ref`.) Re-copy after pulling changes to `index.ts`.
 3. Set the secrets:
    ```sh
    supabase secrets set CUTOUT_TOKEN="$(openssl rand -hex 32)"
