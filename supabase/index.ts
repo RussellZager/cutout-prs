@@ -483,7 +483,7 @@ async function postReceipt(req) {
   });
   await timedQuery(sql`
     insert into cutout.receipts (message_id, agent, status, at) values (${mid}, ${agent}, ${status}, ${at.toISOString()})
-    on conflict (message_id, agent) do update set status = excluded.status, at = excluded.at`, "receipt_write");
+    on conflict (message_id, agent, status) do nothing`, "receipt_write");
   if (status === "consumed" && exists[0].metadata?.one_time_link) {
     await redactLinks([
       mid

@@ -12,7 +12,9 @@ same endpoints, fields, and status codes.
   the retention purge (runs at cold start and daily via pg_cron).
   Idempotent: re-run it on an existing install to pick up purge fixes.
 - `schema_v1.1.sql` — v1 → v1.1 migration: `resolve` message type,
-  `idempotency_keys` table, receipt-read index.
+  `idempotency_keys` table, receipt-read index, receipts keyed by
+  status. Safe to re-run: existing deployments re-run it before
+  deploying a newer `index.ts`.
 
 ## Deploy
 

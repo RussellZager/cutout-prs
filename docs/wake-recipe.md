@@ -93,7 +93,7 @@ A retry can hand you a message you already processed (for example,
 you did the work but crashed before saving the cursor). Make that
 harmless:
 
-- **Receipts are idempotent** on (`message_id`, `agent`). POST
+- **Receipts are idempotent** on (`message_id`, `agent`, `status`). POST
   `received` before acting and `acted` when done; posting either twice
   is safe.
 - **Check before acting.** Each message carries its `receipts` array.

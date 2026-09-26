@@ -11,6 +11,7 @@ then exercises every endpoint and asserts the key behaviors:
   - cursor pagination + cursor echo on empty polls
   - long-poll (?wait=N) returns early when a message arrives
   - receipt idempotency + receipts visible on message reads
+  - receipts ordered by time; a later status never erases an earlier one
   - consumed receipt flips metadata.one_time_link.consumed
   - link expiry honors UTC offsets and the 5-minute clock skew
   - consumed or expired one-time links lose their URL (stored + read)
@@ -452,6 +453,48 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(m["receipts"][0]["agent"], "instinct")
         self.assertEqual(m["receipts"][0]["status"], "received")
         self.assertIn("at", m["receipts"][0])
+
+    def test_12b_receipts_are_a_time_ordered_log(self):
+        r = self.koda.post_message(thread_id="smoke-rcptlog", from_="koda",
+                                   to="*", type="note", body="who saw it?")
+        mid = r["id"]
+        # time order (koda, then instinct) differs from alphabetical order
+        self.koda.post_receipt(mid, "koda", "received")
+        time.sleep(0.01)
+        self.instinct.post_receipt(mid, "instinct", "consumed")
+        time.sleep(0.01)
+        # a later receipt must not erase the earlier `consumed`
+        self.instinct.post_receipt(mid, "instinct", "received")
+        msgs = self.instinct.get_messages(
+            thread_id="smoke-rcptlog")["messages"]
+        m = [x for x in msgs if x["id"] == mid][0]
+        self.assertEqual(
+            [(x["agent"], x["status"]) for x in m["receipts"]],
+            [("koda", "received"), ("instinct", "consumed"),
+             ("instinct", "received")])
+
+    def test_12c_receipts_migration_keeps_rows(self):
+        # a database created before receipts were keyed by status
+        import sqlite3
+        sys.path.insert(0, os.path.join(ROOT, "server"))
+        import cutout_server
+        path = os.path.join(self.tmp.name, "old-receipts.db")
+        db = sqlite3.connect(path)
+        db.executescript(
+            "CREATE TABLE receipts (message_id TEXT NOT NULL,"
+            " agent TEXT NOT NULL, status TEXT NOT NULL, at TEXT NOT NULL,"
+            " PRIMARY KEY (message_id, agent));"
+            "INSERT INTO receipts VALUES"
+            " ('msg_old', 'koda', 'consumed', '2026-01-01T00:00:00Z');")
+        db.commit()
+        db.close()
+        store = cutout_server.Store(path)
+        store.add_receipt("msg_old", "koda", "received",
+                          "2026-01-02T00:00:00Z")
+        self.assertEqual(
+            [(x["agent"], x["status"])
+             for x in store.get_receipts("msg_old")],
+            [("koda", "consumed"), ("koda", "received")])
 
     def test_13_resolve_reopen(self):
         self.koda.post_message(thread_id="smoke-resolve", from_="koda",

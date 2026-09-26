@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS receipts (
     agent      TEXT NOT NULL,
     status     TEXT NOT NULL,
     at         TEXT NOT NULL,
-    PRIMARY KEY (message_id, agent)
+    PRIMARY KEY (message_id, agent, status)
 );
 CREATE TABLE IF NOT EXISTS thread_status (
     thread_id   TEXT PRIMARY KEY,
@@ -88,6 +88,23 @@ CREATE TABLE IF NOT EXISTS thread_status (
     resolved_at TEXT,
     resolved_by TEXT
 );
+"""
+
+# SQLite cannot change a primary key in place: rebuild the table.
+RECEIPTS_MIGRATION = """
+BEGIN;
+CREATE TABLE receipts_new (
+    message_id TEXT NOT NULL,
+    agent      TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    at         TEXT NOT NULL,
+    PRIMARY KEY (message_id, agent, status)
+);
+INSERT INTO receipts_new (message_id, agent, status, at)
+    SELECT message_id, agent, status, at FROM receipts;
+DROP TABLE receipts;
+ALTER TABLE receipts_new RENAME TO receipts;
+COMMIT;
 """
 
 
@@ -195,6 +212,15 @@ class Store:
             self._db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idem"
                 " ON messages(sender, idempotency_key)")
+            # receipts keyed by status: older databases keyed receipts on
+            # (message_id, agent), so a later status overwrote an earlier
+            # one. Rebuild in place; existing rows carry over unchanged.
+            pk = [r["name"] for r in sorted(
+                self._db.execute("PRAGMA table_info(receipts)"),
+                key=lambda r: r["pk"]) if r["pk"]]
+            if pk == ["message_id", "agent"]:
+                self._db.commit()
+                self._db.executescript(RECEIPTS_MIGRATION)
             self._db.commit()
 
     def add_message(self, msg_id, thread_id, sender, recipient, mtype,
@@ -257,7 +283,7 @@ class Store:
         with self._lock:
             rows = self._db.execute(
                 "SELECT agent, status, at FROM receipts"
-                " WHERE message_id = ? ORDER BY at ASC",
+                " WHERE message_id = ? ORDER BY at ASC, rowid ASC",
                 (message_id,)).fetchall()
         return [{"agent": r["agent"], "status": r["status"], "at": r["at"]}
                 for r in rows]
@@ -270,7 +296,8 @@ class Store:
         with self._lock:
             rows = self._db.execute(
                 "SELECT message_id, agent, status, at FROM receipts"
-                " WHERE message_id IN (%s)" % ",".join("?" * len(ids)),
+                " WHERE message_id IN (%s)"
+                " ORDER BY at ASC, rowid ASC" % ",".join("?" * len(ids)),
                 ids).fetchall()
         by_id = {}
         for r in rows:
@@ -318,8 +345,7 @@ class Store:
             self._db.execute(
                 "INSERT INTO receipts (message_id, agent, status, at)"
                 " VALUES (?, ?, ?, ?)"
-                " ON CONFLICT (message_id, agent)"
-                " DO UPDATE SET status = excluded.status, at = excluded.at",
+                " ON CONFLICT (message_id, agent, status) DO NOTHING",
                 (message_id, agent, status, at),
             )
             self._db.commit()
@@ -804,7 +830,8 @@ class Handler(BaseHTTPRequestHandler):
             self._err(404, "unknown message_id")
             return
 
-        # idempotent on (message_id, agent): re-posting is a no-op update
+        # idempotent on (message_id, agent, status): re-posting is a no-op;
+        # a new status is kept alongside earlier ones
         self.store.add_receipt(message_id, agent, status, utcnow())
         if status == "consumed":
             self.store.mark_link_consumed(message_id)

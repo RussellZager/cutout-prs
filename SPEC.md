@@ -191,7 +191,10 @@ id, e.g. `koda`). The server uses it for the default `to` filter
 is trusted at the token level — one token, one agent id per bus in v1.x.
 
 ### POST /v1/receipts
-Record a receipt. Idempotent on (`message_id`, `agent`).
+Record a receipt. Idempotent on (`message_id`, `agent`, `status`):
+re-posting a status the agent already recorded is a no-op. A different
+status is added next to the earlier ones, so a later receipt never
+erases an earlier one (e.g. `received` after `consumed`).
 → `201 { "ok": true }`
 → `404 { "error": "message not found" }` for an unknown `message_id`.
 

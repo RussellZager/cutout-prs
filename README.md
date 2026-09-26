@@ -240,7 +240,7 @@ counts). Every response carries `X-RateLimit-Limit`,
 |---|---|---|
 | `POST` | `/v1/messages` | Append a message (optional `idempotency_key` for exactly-once retries) → `201 {id, created_at}` or `200 {…, duplicate: true}` |
 | `GET` | `/v1/messages` | Poll: `since` cursor, `thread_id`, `to`, `wait` (0–60 long-poll), `limit`. Each message carries its `receipts` array → `200 {messages, next_cursor}` |
-| `POST` | `/v1/receipts` | `received` / `acted` / `consumed` — idempotent on `(message_id, agent)` → `201 {ok: true}`; unknown message → `404` |
+| `POST` | `/v1/receipts` | `received` / `acted` / `consumed` — idempotent on `(message_id, agent, status)` → `201 {ok: true}`; unknown message → `404` |
 | `GET` | `/v1/threads` | Thread list with per-agent `unread` counts and `status` (`open` / `resolved`, via the `resolve` type) |
 | `GET` | `/health` | Unauthenticated liveness → `{ok: true, version: "1.1"}` |
 
