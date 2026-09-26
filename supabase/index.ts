@@ -421,9 +421,11 @@ async function postReceipt(req) {
   await timedQuery(sql`
     insert into cutout.receipts (message_id, agent, status, at) values (${mid}, ${agent}, ${status}, ${at.toISOString()})
     on conflict (message_id, agent) do update set status = excluded.status, at = excluded.at`, "receipt_write");
-  if (status === "consumed" && exists[0].metadata?.one_time_link) {
+  const link = exists[0].metadata?.one_time_link;
+  // Only an object can take the flag; create the key if the link lacks it.
+  if (status === "consumed" && typeof link === "object" && link !== null && !Array.isArray(link)) {
     await timedQuery(sql`update cutout.messages
-              set metadata = jsonb_set(metadata, '{one_time_link,consumed}', 'true'::jsonb, false)
+              set metadata = jsonb_set(metadata, '{one_time_link,consumed}', 'true'::jsonb, true)
               where id = ${mid}`, "consumed_update");
   }
   return jres(201, {
