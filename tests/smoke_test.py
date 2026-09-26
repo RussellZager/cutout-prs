@@ -688,5 +688,63 @@ class UnauthenticatedRateLimitTest(unittest.TestCase):
         self.assertEqual(h.get("x-ratelimit-remaining"), "59")
 
 
+class NulCharacterTest(unittest.TestCase):
+    """NUL characters in POST bodies. Own server, so the main suite's
+    rate-limit budget is untouched."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = free_port()
+        cls.base_url = "http://127.0.0.1:%d" % cls.port
+        cls.tmp = tempfile.TemporaryDirectory()
+        db = os.path.join(cls.tmp.name, "smoke.db")
+        env = dict(os.environ, CUTOUT_TOKEN=TOKEN)
+        cls.proc = subprocess.Popen(
+            [sys.executable, SERVER, "--port", str(cls.port), "--db", db],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                st, _, _ = raw_request(cls.base_url, "GET", "/health")
+                if st == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("server did not start")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait()
+        cls.tmp.cleanup()
+
+    def test_nul_rejected(self):
+        note = {"thread_id": "smoke-nul", "from": "koda", "to": "instinct",
+                "type": "note", "body": "ok"}
+        cases = {
+            "body": dict(note, body="a\u0000b"),
+            "thread_id": dict(note, thread_id="smoke\u0000nul"),
+            "metadata value": dict(note, metadata={"k": "a\u0000b"}),
+            "metadata key": dict(note, metadata={"k\u0000": "v"}),
+        }
+        for name, payload in cases.items():
+            st, _, body = raw_request(self.base_url, "POST", "/v1/messages",
+                                      token=TOKEN, body=payload)
+            with self.subTest(name):
+                self.assertEqual(st, 422, "NUL in %s: %r" % (name, body))
+        st, _, body = raw_request(self.base_url, "POST", "/v1/receipts",
+                                  token=TOKEN, body={
+                                      "message_id": "msg_\u0000",
+                                      "agent": "koda", "status": "received"})
+        self.assertEqual(st, 422, "NUL in message_id: %s %r" % (st, body))
+        # control: the six characters \u0000 as plain text are fine
+        st, _, body = raw_request(self.base_url, "POST", "/v1/messages",
+                                  token=TOKEN,
+                                  body=dict(note, body="literal \\u0000"))
+        self.assertEqual(st, 201, body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -99,6 +99,22 @@ def utcnow():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def has_nul(value):
+    """True if a string or object key anywhere in a parsed JSON value
+    contains U+0000. Postgres cannot store it, so the edge function
+    rejects it; rejecting it here keeps the servers interchangeable."""
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any("\x00" in k or has_nul(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(has_nul(v) for v in value)
+    return False
+
+
+NUL_ERROR = "strings must not contain NUL (\\u0000) characters"
+
+
 def new_id(prefix="msg_"):
     """ULID-style id: 48-bit ms timestamp + 80-bit randomness, Crockford32."""
     ts = int(time.time() * 1000)
@@ -638,6 +654,9 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(val, str) or not val.strip():
                 self._err(422, "%s is required" % field)
                 return
+        if has_nul(data):
+            self._err(422, NUL_ERROR)
+            return
 
         thread_id = data["thread_id"].strip()
         sender = data["from"].strip()
@@ -792,6 +811,9 @@ class Handler(BaseHTTPRequestHandler):
         status = data.get("status")
         if not isinstance(message_id, str) or not message_id:
             self._err(422, "message_id is required")
+            return
+        if has_nul(data):
+            self._err(422, NUL_ERROR)
             return
         if not isinstance(agent, str) or not AGENT_RE.match(agent):
             self._err(422, "agent must be a kebab-case agent id")
