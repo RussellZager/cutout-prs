@@ -29,8 +29,10 @@ then exercises every endpoint and asserts the key behaviors:
 Run:  python3 tests/smoke_test.py
 """
 
+import importlib.util
 import json
 import os
+import random
 import socket
 import sqlite3
 import subprocess
@@ -686,6 +688,137 @@ class UnauthenticatedRateLimitTest(unittest.TestCase):
         self.assertEqual(st, 200)
         h = {k.lower(): v for k, v in headers.items()}
         self.assertEqual(h.get("x-ratelimit-remaining"), "59")
+
+
+class ConcurrentPostTest(unittest.TestCase):
+    """Concurrent posts. Races need many rounds, more than the 60
+    requests/minute budget allows, so each test runs its own in-process
+    server with the rate limit raised."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("cutout_server",
+                                                      SERVER)
+        srv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(srv)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+
+        class Handler(srv.Handler):
+            token = TOKEN
+            rate_limit = 10 ** 6
+            store = srv.Store(os.path.join(tmp.name, "race.db"))
+            retention_days = 0
+
+            def log_message(self, fmt, *args):
+                pass
+
+        class Server(srv.ThreadingHTTPServer):
+            request_queue_size = 64  # default 5 drops connects in a burst
+
+        class YieldingLock:
+            """The store's lock, but it yields right after each release,
+            so concurrent requests interleave between store calls (as
+            they can on a busy server) on every run, not just some."""
+
+            def __init__(self):
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                self._lock.acquire()
+
+            def __exit__(self, *exc):
+                self._lock.release()
+                # a random pause, so neither request always wins the
+                # next acquire
+                time.sleep(random.uniform(0, 0.004))
+
+        Handler.store._lock = YieldingLock()
+        self.addCleanup(Handler.store._db.close)
+        httpd = Server(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.base_url = "http://127.0.0.1:%d" % httpd.server_address[1]
+
+    def _post_together(self, payloads):
+        """POST all payloads at once (released by a barrier); returns
+        [(status, body)] in payload order."""
+        results = [None] * len(payloads)
+        barrier = threading.Barrier(len(payloads))
+
+        def send(i):
+            barrier.wait()
+            # A connection-level failure (seen rarely on loopback under
+            # bursts) is retried once, as a client would. HTTP errors,
+            # 500 included, come back as statuses and are never retried.
+            for attempt in range(2):
+                try:
+                    st, _, body = raw_request(self.base_url, "POST",
+                                              "/v1/messages", token=TOKEN,
+                                              body=payloads[i])
+                    break
+                except OSError as exc:
+                    st, body = 0, {"error": repr(exc)}
+            results[i] = (st, body)
+
+        threads = [threading.Thread(target=send, args=(i,))
+                   for i in range(len(payloads))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        return results
+
+    def test_concurrent_same_key_posts_create_exactly_one(self):
+        # a client retrying one send 10 times at once, 50 times over
+        for n in range(50):
+            payload = {"thread_id": "smoke-idem-race", "from": "koda",
+                       "to": "instinct", "type": "note",
+                       "body": "retried send %d" % n,
+                       "idempotency_key": "race-%d" % n}
+            results = self._post_together([payload] * 10)
+            statuses = sorted(st for st, _ in results)
+            self.assertEqual(statuses, [200] * 9 + [201],
+                             "round %d: %r" % (n, results))
+            self.assertEqual(len({b["id"] for _, b in results}), 1)
+            self.assertEqual(
+                sum(1 for _, b in results if b.get("duplicate")), 9)
+
+    def test_concurrent_resolve_and_note_leave_status_consistent(self):
+        # each round: a resolve and a note hit one thread at the same moment
+        rounds = 50
+        for n in range(rounds):
+            thread = "smoke-status-race-%d" % n
+            results = self._post_together([
+                {"thread_id": thread, "from": "koda", "to": "*",
+                 "type": "resolve", "body": "closing"},
+                {"thread_id": thread, "from": "instinct", "to": "*",
+                 "type": "note", "body": "one more thing"}])
+            self.assertEqual([st for st, _ in results], [201, 201])
+        latest, cursor = {}, None
+        while True:
+            params = {"limit": 100}
+            if cursor:
+                params["since"] = cursor
+            st, _, batch = raw_request(self.base_url, "GET", "/v1/messages",
+                                       token=TOKEN, params=params)
+            self.assertEqual(st, 200)
+            if not batch["messages"]:
+                break
+            for m in batch["messages"]:  # ascending: last one wins
+                latest[m["thread_id"]] = m["type"]
+            cursor = batch["next_cursor"]
+        self.assertEqual(len(latest), rounds)
+        st, _, body = raw_request(self.base_url, "GET", "/v1/threads",
+                                  token=TOKEN)
+        self.assertEqual(st, 200)
+        # a thread is resolved iff its latest message is a resolve
+        wrong = [(t["thread_id"], latest[t["thread_id"]], t["status"])
+                 for t in body["threads"]
+                 if t["status"] != ("resolved"
+                                    if latest[t["thread_id"]] == "resolve"
+                                    else "open")]
+        self.assertEqual(wrong, [])
 
 
 if __name__ == "__main__":

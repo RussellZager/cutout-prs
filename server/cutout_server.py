@@ -200,25 +200,53 @@ class Store:
     def add_message(self, msg_id, thread_id, sender, recipient, mtype,
                     body, reply_to, metadata, created_at,
                     idempotency_key=None):
+        """Append a message and update its thread's status.
+
+        Returns (id, created_at, duplicate). The idempotency check, the
+        insert and the status update share one lock and one commit, so
+        concurrent retries of one key cannot both insert, and a thread's
+        status always follows its latest message.
+        """
         with self._lock:
-            cur = self._db.execute(
-                "INSERT INTO messages (id, thread_id, sender, recipient, type,"
-                " body, reply_to, metadata, created_at, idempotency_key)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (msg_id, thread_id, sender, recipient, mtype, body, reply_to,
-                 json.dumps(metadata) if metadata is not None else None,
-                 created_at, idempotency_key),
-            )
-            self._db.commit()
-            return cur.lastrowid
+            if idempotency_key is not None:
+                original = self._find_by_idempotency_key(sender,
+                                                         idempotency_key)
+                if original:
+                    return original + (True,)
+            try:
+                self._db.execute(
+                    "INSERT INTO messages (id, thread_id, sender, recipient,"
+                    " type, body, reply_to, metadata, created_at,"
+                    " idempotency_key)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (msg_id, thread_id, sender, recipient, mtype, body,
+                     reply_to,
+                     json.dumps(metadata) if metadata is not None else None,
+                     created_at, idempotency_key),
+                )
+                self._set_thread_status(thread_id, mtype, sender, created_at)
+                self._db.commit()
+            except sqlite3.IntegrityError:
+                # The key index is the final word (e.g. another process
+                # on the same db file won the race): return its row.
+                self._db.rollback()
+                original = idempotency_key is not None and \
+                    self._find_by_idempotency_key(sender, idempotency_key)
+                if not original:
+                    raise
+                return original + (True,)
+        return msg_id, created_at, False
 
     def find_by_idempotency_key(self, sender, key):
         """Return (id, created_at) of the original post, or None."""
         with self._lock:
-            row = self._db.execute(
-                "SELECT id, created_at FROM messages"
-                " WHERE sender = ? AND idempotency_key = ?",
-                (sender, key)).fetchone()
+            return self._find_by_idempotency_key(sender, key)
+
+    def _find_by_idempotency_key(self, sender, key):  # caller holds _lock
+        row = self._db.execute(
+            "SELECT id, created_at FROM messages"
+            " WHERE sender = ? AND idempotency_key = ?",
+            (sender, key)).fetchone()
         return (row["id"], row["created_at"]) if row else None
 
     def list_messages(self, since_seq=0, thread_id=None, to=None,
@@ -281,26 +309,24 @@ class Store:
             m["receipts"] = by_id.get(m["id"], [])
         return msgs
 
-    def set_thread_resolved(self, thread_id, resolved_by, resolved_at):
-        with self._lock:
+    def _set_thread_status(self, thread_id, mtype, sender, created_at):
+        """Caller holds _lock and commits. A resolve marks the thread
+        resolved; any new work reopens it."""
+        if mtype == "resolve":
             self._db.execute(
                 "INSERT INTO thread_status (thread_id, status, resolved_at,"
                 " resolved_by) VALUES (?, 'resolved', ?, ?)"
                 " ON CONFLICT (thread_id) DO UPDATE SET"
                 " status = 'resolved', resolved_at = excluded.resolved_at,"
                 " resolved_by = excluded.resolved_by",
-                (thread_id, resolved_at, resolved_by))
-            self._db.commit()
-
-    def reopen_thread(self, thread_id):
-        with self._lock:
+                (thread_id, created_at, sender))
+        else:
             self._db.execute(
                 "INSERT INTO thread_status (thread_id, status, resolved_at,"
                 " resolved_by) VALUES (?, 'open', NULL, NULL)"
                 " ON CONFLICT (thread_id) DO UPDATE SET"
                 " status = 'open', resolved_at = NULL, resolved_by = NULL",
                 (thread_id,))
-            self._db.commit()
 
     def get_thread_status(self, thread_id):
         with self._lock:
@@ -706,16 +732,14 @@ class Handler(BaseHTTPRequestHandler):
                                " a boolean")
                 return
 
-        msg_id = new_id()
-        created_at = utcnow()
-        self.store.add_message(msg_id, thread_id, sender, recipient, mtype,
-                               body, reply_to, metadata, created_at,
-                               idempotency_key)
-        if mtype == "resolve":
-            self.store.set_thread_resolved(thread_id, sender, created_at)
-        else:
-            # any new work reopens a resolved thread
-            self.store.reopen_thread(thread_id)
+        # Re-checks the key atomically: a concurrent retry may have won.
+        msg_id, created_at, duplicate = self.store.add_message(
+            new_id(), thread_id, sender, recipient, mtype, body, reply_to,
+            metadata, utcnow(), idempotency_key)
+        if duplicate:
+            self._send(200, {"id": msg_id, "created_at": created_at,
+                             "duplicate": True})
+            return
         self._send(201, {"id": msg_id, "created_at": created_at})
 
     def _handle_get_messages(self):
