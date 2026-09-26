@@ -36,6 +36,7 @@ import hmac
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -53,6 +54,10 @@ AGENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BODY_MAX_BYTES = 20 * 1024      # spec: body max 20 KB
 METADATA_MAX_BYTES = 16 * 1024  # spec: metadata max 16 KB serialized
 IDEMPOTENCY_KEY_MAX = 128       # spec: idempotency_key max 128 chars
+# Whole request body. Room for a max-size body and metadata even when
+# the client escapes every character (\u0000 is 6 bytes per byte).
+REQUEST_MAX_BYTES = 256 * 1024
+SOCKET_TIMEOUT = 30         # seconds a client may stall mid-request
 RATE_LIMIT = 60             # requests (default; --rate-limit) ...
 RATE_WINDOW = 60.0          # ... per 60 seconds, per token
 LONG_POLL_MAX = 60
@@ -457,6 +462,7 @@ class Store:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "CutoutBus/" + VERSION
+    timeout = SOCKET_TIMEOUT  # a stalled client cannot hold a thread forever
 
     # wired up in main()
     token = ""
@@ -505,23 +511,35 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, {"error": message}, extra_headers)
 
     def _read_json(self):
+        """Returns (data, None) or (None, (status, error))."""
+        cl = (self.headers.get("Content-Length") or "0").strip()
+        # digits only: int() would accept "-1", which makes read() wait
+        # for EOF
+        if not (cl.isascii() and cl.isdigit()):
+            return None, (400, "invalid Content-Length")
+        length = int(cl)
+        if length > REQUEST_MAX_BYTES:
+            return None, (413, "request body too large")
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        raw = self.rfile.read(length) if length else b""
+            raw = self.rfile.read(length) if length else b""
+        except socket.timeout:
+            self.close_connection = True
+            return None, (400, "timed out reading request body")
         if not raw:
-            return None, "empty request body"
+            return None, (400, "empty request body")
         try:
             return json.loads(raw.decode("utf-8")), None
         except (ValueError, UnicodeDecodeError):
-            return None, "malformed JSON body"
+            return None, (400, "malformed JSON body")
 
     def _authorized(self):
         auth = self.headers.get("Authorization") or ""
         if not auth.startswith("Bearer "):
             return False
-        return hmac.compare_digest(auth[7:].strip(), self.token)
+        # Compare bytes: compare_digest raises on non-ASCII str. Headers
+        # arrive latin-1 decoded, so this recovers the bytes sent.
+        presented = auth[7:].strip().encode("latin-1", "replace")
+        return hmac.compare_digest(presented, self.token.encode("utf-8"))
 
     @classmethod
     def _rate_state(cls, consume):
@@ -627,7 +645,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         data, err = self._read_json()
         if err:
-            self._err(400, err)
+            self._err(*err)
             return
         if not isinstance(data, dict):
             self._err(422, "request body must be a JSON object")
@@ -781,7 +799,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         data, err = self._read_json()
         if err:
-            self._err(400, err)
+            self._err(*err)
             return
         if not isinstance(data, dict):
             self._err(422, "request body must be a JSON object")

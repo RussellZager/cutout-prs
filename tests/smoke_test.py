@@ -688,5 +688,52 @@ class UnauthenticatedRateLimitTest(unittest.TestCase):
         self.assertEqual(h.get("x-ratelimit-remaining"), "59")
 
 
+class RequestReadTest(unittest.TestCase):
+    """Malformed requests, sent over a raw socket. Own server, so the
+    main suite's rate-limit budget is untouched."""
+
+    @classmethod
+    def setUpClass(cls):
+        start_server(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_server(cls)
+
+    def _raw(self, head_lines):
+        """Send request headers only (no body), keep the socket open, and
+        return (status, seconds) for the first response line; status is
+        None if nothing arrives within 5 s."""
+        start = time.monotonic()
+        with socket.create_connection(("127.0.0.1", self.port)) as s:
+            s.settimeout(5)
+            s.sendall(b"\r\n".join(head_lines) + b"\r\n\r\n")
+            try:
+                first = s.makefile("rb").readline()
+            except socket.timeout:
+                return None, time.monotonic() - start
+        return int(first.split()[1]), time.monotonic() - start
+
+    def _post_head(self, content_length, token=TOKEN.encode()):
+        return [b"POST /v1/messages HTTP/1.1", b"Host: 127.0.0.1",
+                b"Authorization: Bearer " + token,
+                b"Content-Type: application/json",
+                b"Content-Length: " + content_length]
+
+    def test_negative_content_length_is_400(self):
+        st, secs = self._raw(self._post_head(b"-1"))
+        self.assertEqual(st, 400, "status %r after %.1fs" % (st, secs))
+        self.assertLess(secs, 2)
+
+    def test_oversize_content_length_is_413_before_reading(self):
+        st, secs = self._raw(self._post_head(b"10000000"))
+        self.assertEqual(st, 413, "status %r after %.1fs" % (st, secs))
+        self.assertLess(secs, 2)
+
+    def test_non_ascii_token_is_401(self):
+        st, _ = self._raw(self._post_head(b"2", token="t\u00f6ken".encode()))
+        self.assertEqual(st, 401)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

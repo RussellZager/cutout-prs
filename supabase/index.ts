@@ -11,6 +11,8 @@ const RATE_LIMIT_PER_MIN = Number.isInteger(RATE_LIMIT_ENV) && RATE_LIMIT_ENV >=
 const MAX_BODY_BYTES = 20 * 1024;
 const MAX_METADATA_BYTES = 16 * 1024;
 const MAX_IDEMPOTENCY_KEY = 128;
+// Whole request body; same cap as the reference server.
+const MAX_REQUEST_BYTES = 256 * 1024;
 const VERSION = "1.1";
 const TYPES = [
   "note",
@@ -248,16 +250,57 @@ function validOneTimeLink(link: unknown) {
   }
   return null;
 }
+// Parse a JSON body, reading at most MAX_REQUEST_BYTES.
+// Returns { body } or { res } with a 400/413 response.
+async function readJson(req: Request) {
+  const declared = Number(req.headers.get("content-length") ?? 0);
+  if (declared > MAX_REQUEST_BYTES) return {
+    res: jres(413, {
+      error: "request body too large"
+    })
+  };
+  const chunks = [];
+  let total = 0;
+  if (req.body) {
+    const reader = req.body.getReader();
+    for(;;){
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > MAX_REQUEST_BYTES) {
+        await reader.cancel().catch(()=>{});
+        return {
+          res: jres(413, {
+            error: "request body too large"
+          })
+        };
+      }
+      chunks.push(value);
+    }
+  }
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks){
+    buf.set(c, off);
+    off += c.length;
+  }
+  try {
+    return {
+      body: JSON.parse(new TextDecoder().decode(buf))
+    };
+  } catch  {
+    return {
+      res: jres(400, {
+        error: "invalid JSON"
+      })
+    };
+  }
+}
 // ---- handlers ---------------------------------------------------------------
 async function postMessage(req) {
-  let body;
-  try {
-    body = await req.json();
-  } catch  {
-    return jres(400, {
-      error: "invalid JSON"
-    });
-  }
+  const parsed = await readJson(req);
+  if (parsed.res) return parsed.res;
+  const body = parsed.body;
   for (const f of [
     "thread_id",
     "from",
@@ -445,14 +488,9 @@ async function getMessages(req, arrivedAt) {
   });
 }
 async function postReceipt(req) {
-  let body;
-  try {
-    body = await req.json();
-  } catch  {
-    return jres(400, {
-      error: "invalid JSON"
-    });
-  }
+  const parsed = await readJson(req);
+  if (parsed.res) return parsed.res;
+  const body = parsed.body;
   for (const f of [
     "message_id",
     "agent",
