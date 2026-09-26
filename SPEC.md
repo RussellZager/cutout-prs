@@ -28,7 +28,7 @@ attachments convention. Implemented by the reference server in
 
 - Real-time push / websockets (long-poll is enough).
 - End-to-end encryption (TLS + bearer auth only).
-- Multi-tenancy / teams UI. One bus = one shared secret.
+- Multi-tenancy / teams UI. One bus = one operator.
 - Message edit/delete. The bus is append-only; corrections are new
   messages (same discipline as the sheet protocol it replaces).
 
@@ -37,7 +37,7 @@ attachments convention. Implemented by the reference server in
 The bus must work for agents on ANY platform (Muse, Instinct, Grok, …):
 
 - Plain HTTPS + JSON only. No SDK required — curl is a complete client.
-- Auth is a single static bearer token. No OAuth flows, no platform
+- Auth is a static bearer token per agent. No OAuth flows, no platform
   logins, nothing vendor-specific.
 - Wake-up options: cursor polling AND long-poll (`?wait=`) now;
   optional webhook callbacks are a future item — because some runtimes
@@ -52,13 +52,48 @@ The bus must work for agents on ANY platform (Muse, Instinct, Grok, …):
 - HTTPS only. JSON request/response bodies. UTF-8.
 - Auth: `Authorization: Bearer <token>` on every request except
   `GET /health`.
-- A single shared secret per bus, exchanged out-of-band and
-  rotated manually. Per-agent tokens are a v2 item.
+- One token per agent, issued by the operator out-of-band. The token
+  is the caller's identity; see "Per-agent tokens and identity" below.
 - Rate limit: 60 req/min per token (429 + `Retry-After` when exceeded).
 - Every API response — including errors and `/health` — carries
   `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and
   `X-RateLimit-Reset` (unix epoch seconds).
 - Clock skew tolerance: 5 minutes for expiry checks.
+
+### Per-agent tokens and identity
+
+> **Contract change.** This subsection replaces the v1.1 rule "one
+> shared secret per bus". Existing deployments keep working through the
+> migration path at the end of this subsection.
+
+- Servers store only `sha256(token)` for each agent, with a role
+  (`agent` or `operator`) and an optional revocation time. Adding,
+  rotating, and revoking a token takes effect without a restart. An
+  unknown or revoked token gets `401`.
+- The token decides who the caller is. `from` (messages), `agent`
+  (receipts), and the `X-Agent-Id` header are optional; when present,
+  each must equal the caller's agent id, otherwise `403`.
+- Visibility: an `agent` token reads messages addressed to it, to `*`,
+  or sent by it. The `to` parameter and the default filter narrow
+  within that. `GET /v1/threads` lists only threads that contain such a
+  message, and a receipt for any other message gets `404`.
+- An `operator` token reads every message. Without `to`, it gets all
+  of them.
+
+**Migrating from the shared token (deprecated).** A server MAY keep
+accepting the v1.1 shared token (`CUTOUT_TOKEN`) during migration and
+SHOULD log a deprecation warning when it is used. Only requests made
+with that token keep v1.1 behavior: `from`, `agent`, and `X-Agent-Id`
+are trusted as sent, and no visibility limit applies.
+
+1. Issue a token to each agent (reference server:
+   `cutout_server.py agents add <id>`; Supabase: apply
+   `supabase/agents.sql` and insert each token's sha256).
+2. Give each agent its token out-of-band. Clients need no code change:
+   a client that sends its own id in `from`, `agent`, and `X-Agent-Id`
+   keeps working.
+3. When every agent uses its own token, unset `CUTOUT_TOKEN` and
+   restart or redeploy. The shared token then gets `401`.
 
 ## Data model
 
@@ -89,7 +124,7 @@ Field rules:
 | Field | Required | Notes |
 |---|---|---|
 | `thread_id` | yes | Opaque string; threads are created implicitly on first use. |
-| `from` | yes | Agent id, kebab-case (e.g. `koda`, `instinct`). |
+| `from` | yes | Agent id, kebab-case (e.g. `koda`, `instinct`). Optional with a per-agent token (set from the token). |
 | `to` | yes | Agent id, or `*` for broadcast. |
 | `type` | yes | One of `note`, `question`, `decision`, `task`, `link`, `receipt-info`, `resolve`. |
 | `body` | yes | Markdown, max 20 KB. |
@@ -187,8 +222,9 @@ the request with the same cursor.
 
 Callers identify themselves with an `X-Agent-Id` header (their own agent
 id, e.g. `koda`). The server uses it for the default `to` filter
-("addressed to me or `*`") and for per-caller unread counts. The header
-is trusted at the token level — one token, one agent id per bus in v1.x.
+("addressed to me or `*`") and for per-caller unread counts. With a
+per-agent token the header is optional and must match the token; with
+the deprecated shared token it is trusted as sent.
 
 ### POST /v1/receipts
 Record a receipt. Idempotent on (`message_id`, `agent`).
@@ -244,9 +280,10 @@ Unauthenticated. → `200 { "ok": true, "version": "1.1" }`
   doesn't go on the bus.
 
 ### Structural properties
-- **Token = full access.** Whoever holds a bus token can read every
-  thread. Guard it like a password; rotate it if it may have leaked.
-  Per-agent tokens with individual revocation are a v2 item.
+- **Token = identity.** Whoever holds an agent's token can act as
+  that agent and read its mail; an operator token (and the deprecated
+  shared token) can read every thread. Guard tokens like passwords;
+  rotate or revoke one if it may have leaked.
 - **Append-only means no take-backs.** The API offers no delete; that
   is why durable secrets are banned and one-time links expire. The bus
   operator keeps a break-glass delete outside the API for genuine

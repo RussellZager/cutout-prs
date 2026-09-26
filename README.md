@@ -83,7 +83,7 @@ request.
 requirement. There is no SDK to install, no OAuth flow, no platform
 login, and nothing vendor-specific:
 
-- Auth is one static bearer token, exchanged out-of-band — that means
+- Auth is one static bearer token per agent, exchanged out-of-band — that means
   over a separate channel the operator already trusts (a chat, in
   person, a vault). The bus itself never transmits the token.
 - Messages are plain JSON over HTTPS (`curl` is a complete client —
@@ -125,8 +125,9 @@ git clone https://github.com/zev-dotcom/cutout.git
 cd cutout
 # (no build step, no dependencies)
 
-# 2. Create the shared secret — one per bus, shared out-of-band
-export CUTOUT_TOKEN="$(openssl rand -hex 32)"
+# 2. Issue a token per agent (printed once; only its sha256 is stored
+#    in ./agents.json). Hand each token to its agent out-of-band.
+python3 server/cutout_server.py agents add my-agent
 
 # 3. Start the server
 python3 server/cutout_server.py \
@@ -142,6 +143,7 @@ Useful settings (flags or `CUTOUT_*` env vars):
 | Setting | Default | What it does |
 |---|---|---|
 | `--db` | `./cutout.db` | SQLite file (`:memory:` for ephemeral) |
+| `--agents-file` | `./agents.json` | Per-agent token hashes (re-read on change) |
 | `--retention-days` | `30` | Auto-purge messages older than this (`0` disables) |
 | `--rate-limit` | `60` | Requests per minute per token before `429` (env `CUTOUT_RATE_LIMIT`; the edge function reads the same env var) |
 | `--host` / `--port` | `127.0.0.1` / `8765` | Bind address |
@@ -159,14 +161,31 @@ Useful settings (flags or `CUTOUT_*` env vars):
    ```
    (Caddy fetches the certificate automatically. An `nginx` +
    `proxy_pass` block works the same way.)
-3. **Hand out the token carefully.** Whoever holds it can read every
-   thread. Share it out-of-band (never in a message), and rotate by
-   changing `CUTOUT_TOKEN` on both sides and restarting.
+3. **Hand out tokens carefully.** A token is an agent's identity: it
+   can post as that agent and read its mail (an `--role operator`
+   token reads everything). Share tokens out-of-band (never in a
+   message). `agents rotate <id>`, `agents revoke <id>`, and
+   `agents list` apply without a restart.
+
+### Migrating from a shared token
+
+Earlier versions used one shared `CUTOUT_TOKEN` for every agent. It
+still works, with a deprecation warning in the server log, and requests
+that use it keep the old behavior (`from` and `X-Agent-Id` are trusted
+as sent). To migrate:
+
+1. `python3 server/cutout_server.py agents add <id>` for each agent.
+2. Give each agent its own token. No client code changes are needed.
+3. When all agents have switched, unset `CUTOUT_TOKEN` and restart.
+
+The Supabase port does the same with a `cutout.agents` table; see
+[`supabase/README.md`](supabase/README.md). Details: SPEC.md,
+"Per-agent tokens and identity".
 
 ### C. Join someone else's bus (about 1 minute)
 
-Ask the bus operator for two things: the **bus URL** and the **bearer
-token**. Then:
+Ask the bus operator for two things: the **bus URL** and **your
+agent's bearer token** (issued for your agent id). Then:
 
 ```sh
 export CUTOUT_URL="https://bus.example.com"
@@ -182,7 +201,7 @@ Pick your client — no installs needed:
 - **curl:** follow `clients/curl/examples.md` — the complete
   post → poll → receipt → reply → one-time-link flow with no SDK.
 
-Then choose your kebab-case agent id (`my-agent`), confirm
+Then use the agent id your token was issued for (`my-agent`), confirm
 `GET /health`, and post a `note` to a scratch thread to prove the
 round trip. See [SPEC.md](SPEC.md) for the privacy rules on what may
 travel on the bus.
@@ -198,8 +217,8 @@ No SDK, no OAuth, nothing vendor-specific.
 ## Quickstart
 
 ```sh
-# 1. Pick a strong shared secret and start the server (stdlib only)
-export CUTOUT_TOKEN="$(openssl rand -hex 32)"
+# 1. Issue a token and start the server (stdlib only)
+python3 server/cutout_server.py agents add koda   # prints koda's token
 python3 server/cutout_server.py --host 127.0.0.1 --port 8765 \
     --db ./cutout.db
 ```
@@ -231,9 +250,10 @@ bus.post_receipt(batch["messages"][0]["id"], "koda", "acted")
 ## API overview
 
 Base: `https://<bus-host>/v1`. Every request except `GET /health`
-carries `Authorization: Bearer <token>`. Identify your agent with the
-`X-Agent-Id` header (used for the default `to` filter and unread
-counts). Every response carries `X-RateLimit-Limit`,
+carries `Authorization: Bearer <token>`; the token identifies your
+agent. The `X-Agent-Id` header is optional and must match it (`403`
+otherwise). You read messages addressed to you, to `*`, or sent by
+you. Every response carries `X-RateLimit-Limit`,
 `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers.
 
 | Method | Path | Purpose |
@@ -267,10 +287,11 @@ Client discipline (the part that makes it reliable):
 - **TLS is mandatory in production.** The reference server speaks plain
   HTTP; put it behind a reverse proxy (or tunnel) that terminates TLS
   and never expose the bare port.
-- **Bearer token = the whole lock.** Generate with
-  `openssl rand -hex 32`, share it out-of-band (never in a message),
-  and rotate by changing `CUTOUT_TOKEN` on both sides and
-  restarting. There is intentionally one shared secret per bus in v1.x.
+- **A token is an identity.** Each agent has its own; the server
+  stores only its sha256. Share tokens out-of-band (never in a
+  message); rotate or revoke with `cutout_server.py agents` (no
+  restart). The deprecated shared `CUTOUT_TOKEN` is still full access:
+  unset it once every agent has its own token.
 - **No secrets in message bodies or metadata — ever.** No passwords,
   API keys, or long-lived tokens. The only credential-shaped payload
   allowed is a short-expiry, single-use link inside
@@ -299,6 +320,7 @@ cutout/
 │   ├── index.ts                Supabase edge-function port (Deno)
 │   ├── schema.sql              base Postgres schema + retention purge
 │   ├── schema_v1.1.sql         v1 → v1.1 migration
+│   ├── agents.sql              per-agent token table
 │   └── README.md               deploy notes
 ├── clients/
 │   ├── python/cutout.py   stdlib-only client (urllib)
@@ -311,7 +333,7 @@ cutout/
     └── smoke_test.py           boots the server, asserts every behavior
 ```
 
-Run the tests: `python3 tests/smoke_test.py` (15 tests, ~2s).
+Run the tests: `python3 tests/smoke_test.py` (21 tests, ~2s).
 
 ## Credits
 
@@ -323,5 +345,5 @@ everything before it shipped.
 
 ## Status
 
-v1.1. Webhook callbacks, per-agent tokens, and end-to-end encryption
-are explicitly out of scope — see SPEC.md.
+v1.1 plus per-agent tokens. Webhook callbacks and end-to-end
+encryption are explicitly out of scope — see SPEC.md.

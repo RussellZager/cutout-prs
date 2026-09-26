@@ -8,7 +8,7 @@ Set these once per shell (never commit the token):
 
 ```sh
 export CUTOUT_URL="http://127.0.0.1:8765"   # your bus host
-export CUTOUT_TOKEN="change-me"             # the shared bus secret
+export CUTOUT_TOKEN="change-me"             # your agent's own token
 ```
 
 Small helper used below to pull fields out of JSON responses

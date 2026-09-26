@@ -17,11 +17,16 @@ Implements every endpoint in ../SPEC.md:
     GET  /health         unauthenticated           -> 200 {ok: true, version}
 
 Auth:  Authorization: Bearer <token> on everything but /health.
-Token comes from the CUTOUT_TOKEN environment variable.
+Each agent has its own token; the agents file (default ./agents.json)
+stores only sha256(token) and a role, and is re-read when it changes.
+The token decides who the caller is. The shared CUTOUT_TOKEN still
+works but is deprecated (see SPEC.md, "Authentication and identity").
 
 Run:
-    CUTOUT_TOKEN=change-me python3 cutout_server.py \
-        --host 127.0.0.1 --port 8765 --db ./cutout.db
+    python3 cutout_server.py agents add koda     # prints koda's token once
+    python3 cutout_server.py agents add ops --role operator
+    python3 cutout_server.py agents list | rotate <id> | revoke <id>
+    python3 cutout_server.py --host 127.0.0.1 --port 8765 --db ./cutout.db
 
 This reference server speaks plain HTTP. In production, terminate TLS
 in front of it (reverse proxy) and never expose it without HTTPS.
@@ -36,6 +41,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -173,6 +179,116 @@ def valid_expires_at(value):
         and parse_timestamp(value) is not None
 
 
+def sha256_hex(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# per-agent tokens
+# --------------------------------------------------------------------------
+
+ROLES = ("agent", "operator")
+
+
+class AgentRegistry:
+    """Agents file: {"<agent_id>": {"token_sha256", "role", "revoked_at"}}.
+
+    Only token hashes are stored. The file is re-read whenever it changes,
+    so add / rotate / revoke take effect without a restart. A missing file
+    means no per-agent tokens; an unreadable one keeps the last good copy.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._stamp = None
+        self._by_hash = {}
+
+    def _load(self):
+        with open(self.path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        if not isinstance(doc, dict):
+            raise ValueError("agents file must be a JSON object")
+        table = {}
+        for agent_id, e in doc.items():
+            if not AGENT_RE.match(agent_id) or not isinstance(e, dict) \
+                    or not isinstance(e.get("token_sha256"), str) \
+                    or e.get("role", "agent") not in ROLES:
+                raise ValueError("bad entry for agent %r" % agent_id)
+            if not e.get("revoked_at"):
+                table[e["token_sha256"]] = (agent_id, e.get("role", "agent"))
+        return table
+
+    def lookup(self, token):
+        """Return (agent_id, role) for a live token, else None."""
+        try:
+            st = os.stat(self.path)
+            stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except FileNotFoundError:
+            stamp = None
+        with self._lock:
+            if stamp != self._stamp:
+                self._stamp = stamp
+                try:
+                    self._by_hash = self._load() if stamp else {}
+                except (OSError, ValueError) as exc:
+                    sys.stderr.write("cutout: agents file not reloaded,"
+                                     " keeping previous: %s\n" % exc)
+            return self._by_hash.get(sha256_hex(token))
+
+
+def agents_cli(argv):
+    """`cutout_server.py agents ...`: manage per-agent tokens."""
+    ap = argparse.ArgumentParser(
+        prog="cutout_server.py agents",
+        description="Manage per-agent tokens. A new token is printed once;"
+                    " only its sha256 is stored.")
+    ap.add_argument("action", choices=["add", "rotate", "revoke", "list"])
+    ap.add_argument("agent_id", nargs="?")
+    ap.add_argument("--role", choices=ROLES,
+                    help="add: default agent; rotate: keeps the old role")
+    ap.add_argument("--agents-file",
+                    default=os.environ.get("CUTOUT_AGENTS_FILE",
+                                           "agents.json"))
+    args = ap.parse_args(argv)
+    path = args.agents_file
+    try:
+        with open(path, encoding="utf-8") as fh:
+            agents = json.load(fh)
+    except FileNotFoundError:
+        agents = {}
+    if args.action == "list":
+        print(json.dumps([{"agent_id": a, "role": e.get("role", "agent"),
+                           "revoked_at": e.get("revoked_at")}
+                          for a, e in sorted(agents.items())], indent=2))
+        return 0
+    aid = args.agent_id
+    if not aid or not AGENT_RE.match(aid):
+        ap.error("agent_id must be a kebab-case agent id")
+    if args.action == "add" and aid in agents:
+        ap.error("%s already exists; use rotate" % aid)
+    if args.action != "add" and aid not in agents:
+        ap.error("no such agent: %s" % aid)
+    if args.action == "revoke":
+        agents[aid]["revoked_at"] = utcnow()
+        out = {"agent_id": aid, "revoked_at": agents[aid]["revoked_at"]}
+    else:  # add, rotate (rotate also clears a revocation)
+        token = secrets.token_hex(32)
+        role = args.role or agents.get(aid, {}).get("role", "agent")
+        agents[aid] = {"token_sha256": sha256_hex(token), "role": role,
+                       "revoked_at": None}
+        out = {"agent_id": aid, "role": role, "token": token,
+               "token_sha256": agents[aid]["token_sha256"]}
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(agents, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)  # atomic: the server never reads a partial file
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 # --------------------------------------------------------------------------
 # storage
 # --------------------------------------------------------------------------
@@ -222,10 +338,14 @@ class Store:
         return (row["id"], row["created_at"]) if row else None
 
     def list_messages(self, since_seq=0, thread_id=None, to=None,
-                      caller=None, limit=50):
+                      caller=None, limit=50, visible_to=None):
         q = ("SELECT seq, id, thread_id, sender, recipient, type, body,"
              " reply_to, metadata, created_at FROM messages WHERE seq > ?")
         args = [since_seq]
+        if visible_to is not None:
+            # per-agent token: to me, to '*', or sent by me
+            q += " AND (recipient = ? OR recipient = '*' OR sender = ?)"
+            args += [visible_to, visible_to]
         if thread_id:
             q += " AND thread_id = ?"
             args.append(thread_id)
@@ -406,12 +526,17 @@ class Store:
             self._db.commit()
         return len(doomed_ids), marked
 
-    def thread_list(self):
+    def thread_list(self, visible_to=None):
+        q = ("SELECT thread_id, MAX(created_at) AS last_at, MAX(seq) AS mseq"
+             " FROM messages GROUP BY thread_id")
+        args = []
+        if visible_to is not None:
+            q += (" HAVING SUM(recipient = ? OR recipient = '*'"
+                  " OR sender = ?) > 0")
+            args = [visible_to, visible_to]
         with self._lock:
-            rows = self._db.execute(
-                "SELECT thread_id, MAX(created_at) AS last_at, MAX(seq) AS mseq"
-                " FROM messages GROUP BY thread_id ORDER BY mseq DESC"
-            ).fetchall()
+            rows = self._db.execute(q + " ORDER BY mseq DESC",
+                                    args).fetchall()
         return [{"thread_id": r["thread_id"], "last_at": r["last_at"]}
                 for r in rows]
 
@@ -459,7 +584,9 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "CutoutBus/" + VERSION
 
     # wired up in main()
-    token = ""
+    token = ""      # deprecated shared token (CUTOUT_TOKEN); may be empty
+    agents = None   # AgentRegistry
+    _legacy_warned = None
     store = None
     retention_days = 30
     rate_limit = RATE_LIMIT
@@ -517,11 +644,32 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return None, "malformed JSON body"
 
-    def _authorized(self):
+    def _authenticate(self):
+        """(agent_id, role) for a per-agent token; (None, "legacy") for
+        the deprecated shared token; None when unauthorized."""
         auth = self.headers.get("Authorization") or ""
         if not auth.startswith("Bearer "):
-            return False
-        return hmac.compare_digest(auth[7:].strip(), self.token)
+            return None
+        presented = auth[7:].strip()
+        found = self.agents.lookup(presented) \
+            if self.agents and presented else None
+        if found:
+            return found
+        if self.token and hmac.compare_digest(presented, self.token):
+            self._warn_legacy()
+            return (None, "legacy")
+        return None
+
+    @classmethod
+    def _warn_legacy(cls):
+        now = time.monotonic()
+        if cls._legacy_warned is None or now - cls._legacy_warned >= 3600:
+            cls._legacy_warned = now
+            sys.stderr.write(
+                "cutout: warning: request used the deprecated shared"
+                " CUTOUT_TOKEN, which trusts from/agent/X-Agent-Id as sent."
+                " Issue per-agent tokens (cutout_server.py agents add <id>)"
+                " and then unset CUTOUT_TOKEN.\n")
 
     @classmethod
     def _rate_state(cls, consume):
@@ -558,7 +706,8 @@ class Handler(BaseHTTPRequestHandler):
         have it. Rate-limit headers are attached to every response
         (including 401/429) via self._resp_headers, which _send merges in.
         """
-        if need_auth and not self._authorized():
+        ident = self._authenticate()
+        if need_auth and ident is None:
             self._resp_headers = self._rate_headers(
                 self._rate_state(consume=False))
             self._err(401, "unauthorized: bad or missing bearer token")
@@ -570,7 +719,33 @@ class Handler(BaseHTTPRequestHandler):
             self._err(429, "rate limit exceeded",
                       {"Retry-After": str(info["retry"])})
             return False
+        # self.caller is the calling agent id; self.role is "agent",
+        # "operator", or "legacy" (shared token: X-Agent-Id is trusted).
+        self.caller, self.role = ident or (None, "legacy")
+        claimed = self.headers.get("X-Agent-Id")
+        if self.role == "legacy":
+            self.caller = claimed
+        elif claimed is not None and claimed.strip() != self.caller:
+            self._err(403, "X-Agent-Id does not match your token")
+            return False
         return True
+
+    def _check_self(self, data, field):
+        """Per-agent token: `field` is optional and must name the caller.
+        Fills it in and returns True, or sends 403 and returns False."""
+        if self.role == "legacy":
+            return True
+        claimed = data.get(field)
+        if claimed is not None and (not isinstance(claimed, str)
+                                    or claimed.strip() != self.caller):
+            self._err(403, "%s does not match your token" % field)
+            return False
+        data[field] = self.caller
+        return True
+
+    def _visible_to(self):
+        """Agent id whose visibility limits reads, or None (no limit)."""
+        return self.caller if self.role == "agent" else None
 
     @staticmethod
     def _public(msg):
@@ -631,6 +806,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not isinstance(data, dict):
             self._err(422, "request body must be a JSON object")
+            return
+        if not self._check_self(data, "from"):
             return
 
         for field in ("thread_id", "from", "to", "type", "body"):
@@ -755,14 +932,15 @@ class Handler(BaseHTTPRequestHandler):
 
         thread_id = one("thread_id")
         to = one("to")
-        caller = self.headers.get("X-Agent-Id")
 
         deadline = time.monotonic() + wait
         rows = []
         while True:
             rows = self.store.list_messages(
                 since_seq=since_seq, thread_id=thread_id, to=to,
-                caller=caller, limit=limit)
+                caller=None if self.role == "operator" else self.caller,
+                limit=limit,
+                visible_to=self._visible_to())
             if rows or time.monotonic() >= deadline:
                 break
             time.sleep(0.25)  # long-poll: re-check until wait expires
@@ -786,6 +964,8 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(data, dict):
             self._err(422, "request body must be a JSON object")
             return
+        if not self._check_self(data, "agent"):
+            return
 
         message_id = data.get("message_id")
         agent = data.get("agent")
@@ -800,7 +980,11 @@ class Handler(BaseHTTPRequestHandler):
             self._err(422, "status must be one of: %s"
                       % ", ".join(sorted(RECEIPT_STATUSES)))
             return
-        if self.store.get_message(message_id) is None:
+        msg = self.store.get_message(message_id)
+        me = self._visible_to()
+        if msg is None or (me is not None
+                           and me not in (msg["to"], msg["from"])
+                           and msg["to"] != "*"):
             self._err(404, "unknown message_id")
             return
 
@@ -813,9 +997,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_get_threads(self):
         if not self._guard():
             return
-        caller = self.headers.get("X-Agent-Id")
+        caller = self.caller
         out = []
-        for t in self.store.thread_list():
+        for t in self.store.thread_list(visible_to=self._visible_to()):
             unread = self.store.unread_count(t["thread_id"], caller) \
                 if caller else 0
             st = self.store.get_thread_status(t["thread_id"])
@@ -830,7 +1014,10 @@ class Handler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Project Cutout reference server")
+    if sys.argv[1:2] == ["agents"]:
+        sys.exit(agents_cli(sys.argv[2:]))
+    ap = argparse.ArgumentParser(description="Project Cutout reference server"
+                                 " (tokens: cutout_server.py agents -h)")
     ap.add_argument("--host", default=os.environ.get("CUTOUT_HOST",
                                                      "127.0.0.1"))
     ap.add_argument("--port", type=int,
@@ -838,8 +1025,13 @@ def main():
     ap.add_argument("--db", default=os.environ.get("CUTOUT_DB",
                                                    "cutout.db"),
                     help="SQLite file path (use :memory: for ephemeral)")
+    ap.add_argument("--agents-file",
+                    default=os.environ.get("CUTOUT_AGENTS_FILE",
+                                           "agents.json"),
+                    help="per-agent token hashes (see: agents -h)")
     ap.add_argument("--token", default=os.environ.get("CUTOUT_TOKEN"),
-                    help="shared bearer token (prefer the env var)")
+                    help="DEPRECATED shared bearer token (prefer the env"
+                         " var); kept for migration to per-agent tokens")
     ap.add_argument("--retention-days", type=int,
                     default=int(os.environ.get("CUTOUT_RETENTION_DAYS",
                                                "30")),
@@ -850,12 +1042,19 @@ def main():
                     help="requests per minute per token (default 60)")
     args = ap.parse_args()
 
-    if not args.token:
-        sys.exit("error: set CUTOUT_TOKEN (or pass --token)")
+    if not args.token and not os.path.exists(args.agents_file):
+        sys.exit("error: no agents file at %s; create one with"
+                 " `cutout_server.py agents add <id>`" % args.agents_file)
+    if args.token:
+        sys.stderr.write(
+            "cutout: warning: CUTOUT_TOKEN (shared token) is deprecated."
+            " Requests that use it may claim any from/agent/X-Agent-Id."
+            " Migrate to per-agent tokens; see SPEC.md.\n")
     if args.rate_limit < 1:
         sys.exit("error: --rate-limit must be at least 1")
 
-    Handler.token = args.token
+    Handler.token = args.token or ""
+    Handler.agents = AgentRegistry(args.agents_file)
     Handler.store = Store(args.db)
     Handler.retention_days = args.retention_days
     Handler.rate_limit = args.rate_limit

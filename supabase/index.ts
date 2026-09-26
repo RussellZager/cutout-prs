@@ -1,6 +1,8 @@
 // Cutout Bus - Supabase Edge Function port of the SPEC v1.1 reference server.
 // Wire-compatible with SPEC.md v1.1: same endpoints, fields, status codes.
-// Config via env only (no secrets in code): CUTOUT_TOKEN, SUPABASE_DB_URL (auto).
+// Config via env only (no secrets in code): SUPABASE_DB_URL (auto).
+// Per-agent tokens live in cutout.agents (sha256 only; see agents.sql).
+// CUTOUT_TOKEN, the shared token, is deprecated and optional.
 import postgres from "npm:postgres@3.4.5";
 const DB_URL = Deno.env.get("SUPABASE_DB_URL");
 const BUS_TOKEN = Deno.env.get("CUTOUT_TOKEN") ?? "";
@@ -248,8 +250,59 @@ function validOneTimeLink(link: unknown) {
   }
   return null;
 }
+// ---- auth -------------------------------------------------------------------
+async function sha256Hex(s: string) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(d), (b)=>b.toString(16).padStart(2, "0")).join("");
+}
+let legacyWarnedAt = 0;
+// role is "agent", "operator", or "legacy" (deprecated shared CUTOUT_TOKEN:
+// from/agent/X-Agent-Id are trusted as sent).
+type Caller = { agentId: string | null; role: string };
+async function authenticate(req: Request): Promise<Caller | null> {
+  const auth = req.headers.get("Authorization") ?? "";
+  if (BUS_TOKEN && auth === `Bearer ${BUS_TOKEN}`) {
+    if (Date.now() - legacyWarnedAt > 3600_000) {
+      legacyWarnedAt = Date.now();
+      console.warn("cutout: warning: request used the deprecated shared CUTOUT_TOKEN, which trusts from/agent/X-Agent-Id as sent. Provision per-agent tokens in cutout.agents, then unset CUTOUT_TOKEN.");
+    }
+    return {
+      agentId: req.headers.get("X-Agent-Id"),
+      role: "legacy"
+    };
+  }
+  if (!auth.startsWith("Bearer ")) return null;
+  const token = auth.slice(7).trim();
+  if (!token) return null;
+  try {
+    // No caching: a revocation applies to the next request.
+    const rows = await timedQuery(sql`select agent_id, role from cutout.agents
+      where token_sha256 = ${await sha256Hex(token)} and revoked_at is null`, "auth");
+    return rows.length ? {
+      agentId: rows[0].agent_id,
+      role: rows[0].role
+    } : null;
+  } catch (e) {
+    if ((e as { code?: string })?.code === "42P01") return null; // agents.sql not applied yet
+    throw e;
+  }
+}
+// Per-agent token: body[field] is optional and must name the caller.
+function checkSelf(caller: Caller, body: Record<string, unknown>, field: string) {
+  if (caller.role === "legacy") return null;
+  const v = body[field];
+  if (v !== undefined && v !== null && (typeof v !== "string" || v.trim() !== caller.agentId)) {
+    return jres(403, {
+      error: `${field} does not match your token`
+    });
+  }
+  body[field] = caller.agentId;
+  return null;
+}
+// Agent tokens read messages to them, to '*', or sent by them.
+const visible = (caller: Caller)=>caller.role === "agent" ? sql`and (to_agent = ${caller.agentId} or to_agent = '*' or from_agent = ${caller.agentId})` : sql``;
 // ---- handlers ---------------------------------------------------------------
-async function postMessage(req) {
+async function postMessage(req, caller: Caller) {
   let body;
   try {
     body = await req.json();
@@ -258,6 +311,8 @@ async function postMessage(req) {
       error: "invalid JSON"
     });
   }
+  const forbidden = checkSelf(caller, body, "from");
+  if (forbidden) return forbidden;
   for (const f of [
     "thread_id",
     "from",
@@ -361,12 +416,13 @@ async function postMessage(req) {
     throw e;
   }
 }
-async function getMessages(req, arrivedAt) {
+async function getMessages(req, arrivedAt, caller: Caller) {
   const u = new URL(req.url);
   const since = u.searchParams.get("since");
   const threadId = u.searchParams.get("thread_id");
   const to = u.searchParams.get("to");
-  const agentId = req.headers.get("X-Agent-Id");
+  // An operator without `to` reads every message.
+  const agentId = caller.role === "operator" ? null : caller.agentId;
   let wait = 0, limit = 50;
   if (u.searchParams.has("wait")) {
     wait = Number(u.searchParams.get("wait"));
@@ -392,7 +448,7 @@ async function getMessages(req, arrivedAt) {
       select id, thread_id, from_agent, to_agent, type, body, reply_to, created_at,
              (extract(epoch from created_at) * 1000000)::bigint as created_us, metadata
       from cutout.messages
-      where true
+      where true ${visible(caller)}
       ${cursor ? sql`and ((extract(epoch from created_at) * 1000000)::bigint > ${cursor.us} or ((extract(epoch from created_at) * 1000000)::bigint = ${cursor.us} and id > ${cursor.id}))` : sql``}
       ${threadId ? sql`and thread_id = ${threadId}` : sql``}
       ${to ? sql`and to_agent = ${to}` : agentId ? sql`and (to_agent = ${agentId} or to_agent = '*')` : sql``}
@@ -444,7 +500,7 @@ async function getMessages(req, arrivedAt) {
     next_cursor: nextCursor
   });
 }
-async function postReceipt(req) {
+async function postReceipt(req, caller: Caller) {
   let body;
   try {
     body = await req.json();
@@ -453,6 +509,8 @@ async function postReceipt(req) {
       error: "invalid JSON"
     });
   }
+  const forbidden = checkSelf(caller, body, "agent");
+  if (forbidden) return forbidden;
   for (const f of [
     "message_id",
     "agent",
@@ -477,7 +535,7 @@ async function postReceipt(req) {
     });
   }
   const mid = body.message_id, agent = body.agent, status = body.status;
-  const exists = await timedQuery(sql`select metadata from cutout.messages where id = ${mid}`, "receipt_exists");
+  const exists = await timedQuery(sql`select metadata from cutout.messages where id = ${mid} ${visible(caller)}`, "receipt_exists");
   if (exists.length === 0) return jres(404, {
     error: "message not found"
   });
@@ -493,8 +551,8 @@ async function postReceipt(req) {
     ok: true
   });
 }
-async function getThreads(req) {
-  const agentId = req.headers.get("X-Agent-Id");
+async function getThreads(req, caller: Caller) {
+  const agentId = caller.agentId;
   const rows = await timedQuery(sql`
     select m.thread_id, max(m.created_at) as last_at,
       (array_agg(m.type order by m.created_at desc, m.id desc))[1] as last_type,
@@ -504,6 +562,7 @@ async function getThreads(req) {
       )::int` : sql`0`} as unread
     from cutout.messages m
     group by m.thread_id
+    ${caller.role === "agent" ? sql`having bool_or(m.to_agent = ${agentId} or m.to_agent = '*' or m.from_agent = ${agentId})` : sql``}
     order by last_at desc`, "threads");
   return jres(200, {
     // Resolved iff the latest message is a resolve; any later non-resolve message reopens.
@@ -535,8 +594,8 @@ async function route(req, arrivedAt) {
     }),
     state: null
   };
-  const auth = req.headers.get("Authorization") ?? "";
-  if (!BUS_TOKEN || auth !== `Bearer ${BUS_TOKEN}`) return {
+  const caller = await authenticate(req);
+  if (!caller) return {
     res: jres(401, {
       error: "unauthorized"
     }),
@@ -547,20 +606,27 @@ async function route(req, arrivedAt) {
     res: limited,
     state
   };
+  const claimed = req.headers.get("X-Agent-Id");
+  if (caller.role !== "legacy" && claimed !== null && claimed.trim() !== caller.agentId) return {
+    res: jres(403, {
+      error: "X-Agent-Id does not match your token"
+    }),
+    state
+  };
   if (path === "/v1/messages" && req.method === "POST") return {
-    res: await postMessage(req),
+    res: await postMessage(req, caller),
     state
   };
   if (path === "/v1/messages" && req.method === "GET") return {
-    res: await getMessages(req, arrivedAt),
+    res: await getMessages(req, arrivedAt, caller),
     state
   };
   if (path === "/v1/receipts" && req.method === "POST") return {
-    res: await postReceipt(req),
+    res: await postReceipt(req, caller),
     state
   };
   if (path === "/v1/threads" && req.method === "GET") return {
-    res: await getThreads(req),
+    res: await getThreads(req, caller),
     state
   };
   return {

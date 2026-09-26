@@ -29,6 +29,7 @@ then exercises every endpoint and asserts the key behaviors:
 Run:  python3 tests/smoke_test.py
 """
 
+import hashlib
 import json
 import os
 import socket
@@ -686,6 +687,177 @@ class UnauthenticatedRateLimitTest(unittest.TestCase):
         self.assertEqual(st, 200)
         h = {k.lower(): v for k, v in headers.items()}
         self.assertEqual(h.get("x-ratelimit-remaining"), "59")
+
+
+class AgentTokenTest(unittest.TestCase):
+    """Per-agent tokens: the token is the identity. Own server (and rate
+    budget), with the deprecated shared token also set, as in a
+    deployment that is part-way through migrating."""
+
+    LEGACY = "legacy-shared-token"
+    TOKENS = {"koda": "koda-token", "instinct": "instinct-token",
+              "third": "third-token", "ops": "ops-token"}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = free_port()
+        cls.base_url = "http://127.0.0.1:%d" % cls.port
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.agents_file = os.path.join(cls.tmp.name, "agents.json")
+        agents = {a: {"token_sha256": hashlib.sha256(t.encode()).hexdigest(),
+                      "role": "operator" if a == "ops" else "agent",
+                      "revoked_at": None}
+                  for a, t in cls.TOKENS.items()}
+        with open(cls.agents_file, "w") as fh:
+            json.dump(agents, fh)
+        cls.log = os.path.join(cls.tmp.name, "server.log")
+        env = dict(os.environ, CUTOUT_TOKEN=cls.LEGACY,
+                   CUTOUT_AGENTS_FILE=cls.agents_file)
+        cls.proc = subprocess.Popen(
+            [sys.executable, SERVER, "--port", str(cls.port),
+             "--db", os.path.join(cls.tmp.name, "agents.db")],
+            env=env, stdout=subprocess.DEVNULL,
+            stderr=open(cls.log, "w"))
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                st, _, _ = raw_request(cls.base_url, "GET", "/health")
+                if st == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("server did not start")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait()
+        cls.tmp.cleanup()
+
+    def req(self, agent, method, path, **kw):
+        return raw_request(self.base_url, method, path,
+                           token=self.TOKENS[agent], **kw)
+
+    def post(self, agent, **fields):
+        msg = {"thread_id": "tok", "to": "instinct", "type": "note",
+               "body": "hi"}
+        msg.update(fields)
+        return self.req(agent, "POST", "/v1/messages", body=msg)
+
+    def bodies(self, agent, **params):
+        st, _, body = self.req(agent, "GET", "/v1/messages", params=params)
+        self.assertEqual(st, 200)
+        return [m["body"] for m in body["messages"]]
+
+    def cli(self, *args):
+        return subprocess.run(
+            [sys.executable, SERVER, "agents"] + list(args)
+            + ["--agents-file", self.agents_file],
+            capture_output=True, text=True)
+
+    def test_impersonation_rejected(self):
+        st, _, _ = self.post("koda", **{"from": "instinct"})
+        self.assertEqual(st, 403)
+        st, _, _ = self.req("koda", "GET", "/v1/messages",
+                            agent_id="instinct")
+        self.assertEqual(st, 403)
+        # `from` is optional and comes from the token
+        st, _, body = self.post("koda", thread_id="tok-self",
+                                body="from my token")
+        self.assertEqual(st, 201)
+        st, _, got = self.req("instinct", "GET", "/v1/messages",
+                              params={"thread_id": "tok-self"})
+        self.assertEqual([m["from"] for m in got["messages"]], ["koda"])
+
+    def test_third_agent_cannot_read_direct_mail(self):
+        self.post("koda", thread_id="tok-dm", body="dm for instinct")
+        self.post("koda", thread_id="tok-dm", to="*", body="broadcast")
+        self.assertEqual(self.bodies("third", thread_id="tok-dm"),
+                         ["broadcast"])
+        self.assertEqual(self.bodies("third", to="instinct",
+                                     thread_id="tok-dm"), [])
+        # addressee and sender still see it
+        self.assertIn("dm for instinct",
+                      self.bodies("instinct", thread_id="tok-dm"))
+        self.assertEqual(self.bodies("koda", to="instinct",
+                                     thread_id="tok-dm"),
+                         ["dm for instinct"])
+        self.post("koda", thread_id="tok-dm-only", body="private thread")
+        st, _, body = self.req("third", "GET", "/v1/threads")
+        self.assertNotIn("tok-dm-only",
+                         [t["thread_id"] for t in body["threads"]])
+
+    def test_operator_sees_all(self):
+        self.post("koda", thread_id="tok-ops", body="koda to instinct")
+        self.post("instinct", thread_id="tok-ops", to="koda",
+                  body="instinct to koda")
+        self.assertEqual(self.bodies("ops", thread_id="tok-ops"),
+                         ["koda to instinct", "instinct to koda"])
+
+    def test_receipt_spoof_rejected(self):
+        st, _, body = self.post("koda", thread_id="tok-rcpt")
+        self.assertEqual(st, 201)
+        mid = body["id"]
+        st, _, _ = self.req("koda", "POST", "/v1/receipts",
+                            body={"message_id": mid, "agent": "instinct",
+                                  "status": "acted"})
+        self.assertEqual(st, 403)
+        # a message the caller cannot see is unknown to it
+        st, _, _ = self.req("third", "POST", "/v1/receipts",
+                            body={"message_id": mid, "status": "acted"})
+        self.assertEqual(st, 404)
+        st, _, _ = self.req("instinct", "POST", "/v1/receipts",
+                            body={"message_id": mid, "status": "acted"})
+        self.assertEqual(st, 201)
+        st, _, got = self.req("instinct", "GET", "/v1/messages",
+                              params={"thread_id": "tok-rcpt"})
+        self.assertEqual([(r["agent"], r["status"])
+                          for r in got["messages"][0]["receipts"]],
+                         [("instinct", "acted")])
+
+    def test_legacy_token_still_works_with_warning(self):
+        st, _, _ = raw_request(
+            self.base_url, "POST", "/v1/messages", token=self.LEGACY,
+            body={"thread_id": "tok-legacy", "from": "old-agent",
+                  "to": "*", "type": "note", "body": "legacy"})
+        self.assertEqual(st, 201)
+        st, _, body = raw_request(self.base_url, "GET", "/v1/messages",
+                                  token=self.LEGACY, agent_id="old-agent",
+                                  params={"thread_id": "tok-legacy"})
+        self.assertEqual(st, 200)
+        self.assertEqual([m["from"] for m in body["messages"]],
+                         ["old-agent"])
+        with open(self.log) as fh:
+            self.assertIn("used the deprecated shared CUTOUT_TOKEN",
+                          fh.read())
+
+    def test_revoked_and_rotated_tokens_rejected(self):
+        r = self.cli("add", "temp")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        token = json.loads(r.stdout)["token"]
+        with open(self.agents_file) as fh:
+            self.assertNotIn(token, fh.read())  # only the hash is stored
+        auth = dict(token=token, params={"thread_id": "tok-rev"})
+        st, _, _ = raw_request(self.base_url, "GET", "/v1/messages", **auth)
+        self.assertEqual(st, 200)
+        r = self.cli("rotate", "temp")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        new_token = json.loads(r.stdout)["token"]
+        st, _, _ = raw_request(self.base_url, "GET", "/v1/messages", **auth)
+        self.assertEqual(st, 401)
+        st, _, _ = raw_request(self.base_url, "GET", "/v1/messages",
+                               token=new_token)
+        self.assertEqual(st, 200)
+        r = self.cli("revoke", "temp")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        st, _, _ = raw_request(self.base_url, "GET", "/v1/messages",
+                               token=new_token)
+        self.assertEqual(st, 401)
+        listed = {a["agent_id"]: a
+                  for a in json.loads(self.cli("list").stdout)}
+        self.assertIsNotNone(listed["temp"]["revoked_at"])
 
 
 if __name__ == "__main__":
