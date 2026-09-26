@@ -16,6 +16,10 @@ create table if not exists cutout.idempotency_keys (
   primary key (from_agent, idem_key)
 );
 create index if not exists idempotency_keys_msg_idx on cutout.idempotency_keys (message_id);
+-- Fingerprint of the original payload, so reusing a key with a different
+-- payload is rejected. NULL on keys stored before this column existed
+-- (treated as a match). Safe to re-run on an existing v1.1 database.
+alter table cutout.idempotency_keys add column if not exists payload_hash text;
 
 -- (1) receipt reads: lookup by message ordered by time.
 create index if not exists receipts_msg_at_idx on cutout.receipts (message_id, at);

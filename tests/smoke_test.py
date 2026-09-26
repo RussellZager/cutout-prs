@@ -18,6 +18,7 @@ then exercises every endpoint and asserts the key behaviors:
     malformed stored links (tests/supabase_test.py runs the same cases
     against the edge function and the SQL purge)
   - idempotency keys: replay returns the original, no double-post
+  - idempotency keys: reuse with a different payload is a 409
   - resolve/reopen thread lifecycle
   - rate-limit headers on API responses
   - 413 on oversize body / metadata
@@ -686,6 +687,51 @@ class UnauthenticatedRateLimitTest(unittest.TestCase):
         self.assertEqual(st, 200)
         h = {k.lower(): v for k, v in headers.items()}
         self.assertEqual(h.get("x-ratelimit-remaining"), "59")
+
+
+class IdempotencyConflictTest(unittest.TestCase):
+    """Runs on its own server: SmokeTest uses nearly all of its rate
+    budget before test_99."""
+
+    @classmethod
+    def setUpClass(cls):
+        start_server(cls)
+        cls.koda = Client(base_url=cls.base_url, token=TOKEN,
+                          agent_id="koda")
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_server(cls)
+
+    def post(self, body):
+        return self.koda.post_message(thread_id="smoke-idem-conflict",
+                                      from_="koda", to="instinct",
+                                      type="note", body=body,
+                                      idempotency_key="smoke-idem-002")
+
+    def test_same_key_different_payload_is_rejected(self):
+        r1 = self.post("first")
+        # same key, different payload: an error, not a silent duplicate
+        with self.assertRaises(CutoutError) as ctx:
+            self.post("second")
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertIn("error", ctx.exception.body)
+        # same key, same payload: still the original, as before
+        r2 = self.post("first")
+        self.assertEqual(r2["id"], r1["id"])
+        self.assertTrue(r2["duplicate"])
+        msgs = self.koda.get_messages(thread_id="smoke-idem-conflict",
+                                      to="instinct")["messages"]
+        self.assertEqual([m["body"] for m in msgs], ["first"])
+        # rows stored before fingerprints existed replay as before
+        db = sqlite3.connect(os.path.join(self.tmp.name, "smoke.db"))
+        with db:
+            db.execute("UPDATE messages SET idempotency_fp = NULL"
+                       " WHERE id = ?", (r1["id"],))
+        db.close()
+        r3 = self.post("second")
+        self.assertEqual(r3["id"], r1["id"])
+        self.assertTrue(r3["duplicate"])
 
 
 if __name__ == "__main__":

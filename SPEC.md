@@ -113,7 +113,9 @@ Field rules:
 `from` agent. Re-posting the same key from the same agent appends
 nothing and returns `200 { "id", "created_at", "duplicate": true }`
 with the ORIGINAL `id` and `created_at`. Keys are honored for the
-retention window (they expire with their message).
+retention window (they expire with their message). Re-posting the same
+key with a different payload appends nothing and returns
+`409 { "error": "..." }`.
 
 Client rule: generate ONE key per logical send (uuid4 hex is fine) and
 reuse it across every retry of that send. This gives exactly-once

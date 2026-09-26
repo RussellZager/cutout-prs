@@ -127,6 +127,20 @@ function decodeCursor(c) {
     return null;
   }
 }
+// Stable hash of a payload (object keys sorted), used to tell a retry from a
+// different message sent under the same idempotency key.
+function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v !== null && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o).sort().map((k)=>`${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+async function fingerprint(v: unknown): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalJson(v)));
+  return Array.from(new Uint8Array(digest), (b)=>b.toString(16).padStart(2, "0")).join("");
+}
 function serialize(m) {
   return {
     id: m.id,
@@ -317,18 +331,31 @@ async function postMessage(req) {
     idemKey = body.idempotency_key;
   }
   const from = body.from;
+  const payloadHash = idemKey === null ? null : await fingerprint([
+    body.thread_id,
+    body.to,
+    body.type,
+    body.body,
+    body.reply_to ?? null,
+    metadata
+  ]);
   const findDup = async ()=>idemKey === null ? [] : await sql`
-    select m.id, m.created_at from cutout.idempotency_keys k
+    select m.id, m.created_at, k.payload_hash from cutout.idempotency_keys k
     join cutout.messages m on m.id = k.message_id
     where k.from_agent = ${from} and k.idem_key = ${idemKey}`;
+  // Same key: a retry returns the original; a different payload is rejected.
+  // Keys stored without a hash (before it existed) are treated as a match.
+  const replay = (d: { id: string; created_at: Date; payload_hash: string | null })=>d.payload_hash !== null && d.payload_hash !== payloadHash ? jres(409, {
+      error: "idempotency_key already used with a different payload"
+    }) : jres(200, {
+      id: d.id,
+      created_at: iso(d.created_at),
+      duplicate: true
+    });
   // Keys are honored for the retention window: the key row cascades away with
   // its message when the purge removes it.
   const dup = await timedQuery(findDup(), "find_duplicate");
-  if (dup.length) return jres(200, {
-    id: dup[0].id,
-    created_at: iso(dup[0].created_at),
-    duplicate: true
-  });
+  if (dup.length) return replay(dup[0]);
   const id = "msg_" + ulid();
   try {
     const rows = await timedQuery(sql.begin(async (tx)=>{
@@ -339,8 +366,8 @@ async function postMessage(req) {
                 ${body.reply_to ?? null}, ${sql.json(metadata)})
         returning id, created_at`;
       if (idemKey !== null) {
-        await tx`insert into cutout.idempotency_keys (from_agent, idem_key, message_id)
-                 values (${from}, ${idemKey}, ${id})`;
+        await tx`insert into cutout.idempotency_keys (from_agent, idem_key, message_id, payload_hash)
+                 values (${from}, ${idemKey}, ${id}, ${payloadHash})`;
       }
       return r;
     }), "post_transaction", 3500);
@@ -352,11 +379,7 @@ async function postMessage(req) {
     // Concurrent re-post of the same key lost the race: return the winner.
     if (e.code === "23505" && idemKey !== null) {
       const d = await timedQuery(findDup(), "find_duplicate_retry");
-      if (d.length) return jres(200, {
-        id: d[0].id,
-        created_at: iso(d[0].created_at),
-        duplicate: true
-      });
+      if (d.length) return replay(d[0]);
     }
     throw e;
   }

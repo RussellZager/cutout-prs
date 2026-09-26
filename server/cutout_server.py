@@ -9,6 +9,8 @@ Implements every endpoint in ../SPEC.md:
     POST /v1/messages    append a message (idempotency_key supported)
                          -> 201 {id, created_at}
                          -> 200 {id, created_at, duplicate: true} on replay
+                         -> 409 {error} if the key was used with a
+                            different payload
     GET  /v1/messages    poll with cursors; messages carry `receipts`
                          -> 200 {messages, next_cursor}
     POST /v1/receipts    record a receipt          -> 201 {ok: true}
@@ -173,6 +175,15 @@ def valid_expires_at(value):
         and parse_timestamp(value) is not None
 
 
+def payload_fingerprint(thread_id, recipient, mtype, body, reply_to,
+                        metadata):
+    """Stable hash of what a post says (the sender is the key's scope),
+    used to tell a retry from a different message under the same key."""
+    canon = json.dumps([thread_id, recipient, mtype, body, reply_to,
+                        metadata], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
 # --------------------------------------------------------------------------
 # storage
 # --------------------------------------------------------------------------
@@ -190,6 +201,10 @@ class Store:
             if "idempotency_key" not in cols:
                 self._db.execute(
                     "ALTER TABLE messages ADD COLUMN idempotency_key TEXT")
+            # payload fingerprint for keyed posts; NULL on older rows
+            if "idempotency_fp" not in cols:
+                self._db.execute(
+                    "ALTER TABLE messages ADD COLUMN idempotency_fp TEXT")
             # NULL keys never collide in a UNIQUE index, so plain posts
             # are unaffected; scoped per sender.
             self._db.execute(
@@ -199,27 +214,30 @@ class Store:
 
     def add_message(self, msg_id, thread_id, sender, recipient, mtype,
                     body, reply_to, metadata, created_at,
-                    idempotency_key=None):
+                    idempotency_key=None, idempotency_fp=None):
         with self._lock:
             cur = self._db.execute(
                 "INSERT INTO messages (id, thread_id, sender, recipient, type,"
-                " body, reply_to, metadata, created_at, idempotency_key)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " body, reply_to, metadata, created_at, idempotency_key,"
+                " idempotency_fp)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (msg_id, thread_id, sender, recipient, mtype, body, reply_to,
                  json.dumps(metadata) if metadata is not None else None,
-                 created_at, idempotency_key),
+                 created_at, idempotency_key, idempotency_fp),
             )
             self._db.commit()
             return cur.lastrowid
 
     def find_by_idempotency_key(self, sender, key):
-        """Return (id, created_at) of the original post, or None."""
+        """Return (id, created_at, fingerprint) of the original post, or
+        None. fingerprint is None for rows stored before it existed."""
         with self._lock:
             row = self._db.execute(
-                "SELECT id, created_at FROM messages"
+                "SELECT id, created_at, idempotency_fp FROM messages"
                 " WHERE sender = ? AND idempotency_key = ?",
                 (sender, key)).fetchone()
-        return (row["id"], row["created_at"]) if row else None
+        return (row["id"], row["created_at"], row["idempotency_fp"]) \
+            if row else None
 
     def list_messages(self, since_seq=0, thread_id=None, to=None,
                       caller=None, limit=50):
@@ -647,6 +665,7 @@ class Handler(BaseHTTPRequestHandler):
         reply_to = data.get("reply_to")
         metadata = data.get("metadata")
         idempotency_key = data.get("idempotency_key")
+        idempotency_fp = None
 
         if not AGENT_RE.match(sender):
             self._err(422, "from must be a kebab-case agent id")
@@ -679,10 +698,18 @@ class Handler(BaseHTTPRequestHandler):
                                " up to 128 chars")
                 return
             idempotency_key = idempotency_key.strip()
+            idempotency_fp = payload_fingerprint(
+                thread_id, recipient, mtype, body, reply_to, metadata)
             # Safe retry: the same logical send returns the original.
             original = self.store.find_by_idempotency_key(
                 sender, idempotency_key)
             if original:
+                # A different payload under the same key is not a retry;
+                # rows stored without a fingerprint are treated as a match.
+                if original[2] is not None and original[2] != idempotency_fp:
+                    self._err(409, "idempotency_key already used with a"
+                                   " different payload")
+                    return
                 self._send(200, {"id": original[0],
                                  "created_at": original[1],
                                  "duplicate": True})
@@ -710,7 +737,7 @@ class Handler(BaseHTTPRequestHandler):
         created_at = utcnow()
         self.store.add_message(msg_id, thread_id, sender, recipient, mtype,
                                body, reply_to, metadata, created_at,
-                               idempotency_key)
+                               idempotency_key, idempotency_fp)
         if mtype == "resolve":
             self.store.set_thread_resolved(thread_id, sender, created_at)
         else:
