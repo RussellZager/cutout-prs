@@ -38,7 +38,11 @@ function poolerUrl(direct) {
   const host = Deno.env.get("POOLER_HOST");
   if (!host) return direct;
   const u = new URL(direct);
-  const ref = u.hostname.replace(/^db\./, "").split(".")[0]; // db.<ref>.supabase.co -> <ref>
+  // db.<ref>.supabase.co -> <ref>; a URL that already points at a pooler
+  // carries the ref in its username (postgres.<ref>). Anything else: as is.
+  const m = /^db\.([^.]+)\.supabase\.co$/.exec(u.hostname);
+  const ref = m ? m[1] : u.username.startsWith("postgres.") ? u.username.slice(9) : null;
+  if (!ref) return direct;
   u.hostname = host;
   u.port = "6543";
   u.username = `postgres.${ref}`;
@@ -184,6 +188,14 @@ async function rateLimit() {
     state
   };
 }
+// Postgres text and jsonb cannot store U+0000; without this check the insert
+// fails with a 500. Checks every string value and object key in the payload.
+function hasNul(v: unknown): boolean {
+  if (typeof v === "string") return v.includes("\u0000");
+  if (typeof v !== "object" || v === null) return false;
+  return Object.entries(v).some(([k, x])=>k.includes("\u0000") || hasNul(x));
+}
+const NUL_ERROR = "strings must not contain NUL (\\u0000) characters";
 function validAttachments(a) {
   if (!Array.isArray(a)) return "metadata.attachments must be an array";
   for (const [i, x] of a.entries()){
@@ -271,6 +283,9 @@ async function postMessage(req) {
       });
     }
   }
+  if (hasNul(body)) return jres(422, {
+    error: NUL_ERROR
+  });
   if (!TYPES.includes(body.type)) {
     return jres(422, {
       error: `type must be one of ${TYPES.join(", ")}`
@@ -332,6 +347,10 @@ async function postMessage(req) {
   const id = "msg_" + ulid();
   try {
     const rows = await timedQuery(sql.begin(async (tx)=>{
+      // Postgres cancels a slow statement and rolls the transaction back
+      // (503 below). Bounding each statement well under the 3.5 s race keeps
+      // that race from abandoning a transaction that then commits anyway.
+      await tx`set local statement_timeout = '1s'`;
       const r = await tx`
         insert into cutout.messages (id, thread_id, from_agent, to_agent, type, body, reply_to, metadata)
         values (${id}, ${body.thread_id}, ${from}, ${body.to},
@@ -349,6 +368,12 @@ async function postMessage(req) {
       created_at: iso(rows[0].created_at)
     });
   } catch (e) {
+    // statement_timeout fired: nothing was written, so the client may retry.
+    if ((e as { code?: string }).code === "57014") return jres(503, {
+      error: "database timeout; retry"
+    }, {
+      "Retry-After": "1"
+    });
     // Concurrent re-post of the same key lost the race: return the winner.
     if (e.code === "23505" && idemKey !== null) {
       const d = await timedQuery(findDup(), "find_duplicate_retry");
@@ -464,6 +489,9 @@ async function postReceipt(req) {
       });
     }
   }
+  if (hasNul(body)) return jres(422, {
+    error: NUL_ERROR
+  });
   if (!RECEIPT_STATUSES.includes(body.status)) {
     return jres(422, {
       error: `status must be one of ${RECEIPT_STATUSES.join(", ")}`
